@@ -1230,16 +1230,32 @@ def main():
     st.title("夏季休暇調整アプリ")
     st.caption("初回締切時に全希望を同時評価し、締切後は既存予定とのコンフリクトを随時判定します。")
 
-    pages = {
-        "管理者設定": page_admin_settings,
-        "ユーザー管理": page_users,
-        "レジデント役割": page_roles,
-        "既存不在入力": page_absences,
-        "夏季休暇希望入力": page_requests,
-        "一括判定・確定": page_batch_review,
-        "予定一覧": page_assignments,
-        "稼働状況": page_dashboard,
-    }
+    st.sidebar.markdown("## ログイン")
+
+    admin_password = st.sidebar.text_input(
+        "管理者パスワード",
+        type="password"
+    )
+
+    is_admin = admin_password == "admin123"
+
+    if is_admin:
+        pages = {
+            "管理者設定": page_admin_settings,
+            "ユーザー管理": page_users,
+            "レジデント役割": page_roles,
+            "既存不在入力": page_absences,
+            "夏季休暇希望入力": page_requests,
+            "一括判定・確定": page_batch_review,
+            "予定一覧": page_assignments,
+            "稼働状況": page_dashboard,
+        }
+    else:
+        pages = {
+            "既存不在入力": page_absences,
+            "夏季休暇希望入力": page_requests,
+            "予定一覧": page_assignments,
+        }
 
     choice = st.sidebar.radio("メニュー", list(pages.keys()))
     st.sidebar.markdown("---")
