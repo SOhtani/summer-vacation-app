@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+summer_vacation.db
+.streamlit/secrets.toml
