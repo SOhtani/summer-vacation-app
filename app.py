@@ -1055,9 +1055,15 @@ def page_requests():
     for i, (s, e) in enumerate(st.session_state.date_blocks):
         c1, c2 = st.columns(2)
         with c1:
-            ns = calendar_date_picker(f"ブロック{i+1}開始", f"block_s_{i}", s)
+            ns = st.date_input(f"ブロック{i+1}開始", s, key=f"block_s_{i}")
         with c2:
-            ne = calendar_date_picker(f"ブロック{i+1}終了", f"block_e_{i}", e)
+            ne = st.date_input(f"ブロック{i+1}終了", e, key=f"block_e_{i}")
+
+        block_workdays = workdays_between(ns, ne)
+        st.caption(
+            f"ブロック{i+1}: {len(block_workdays)}勤務日 "
+            f"（土日・登録済み非勤務日は除外）"
+        )
         new_blocks.append((ns, ne))
     st.session_state.date_blocks = new_blocks
 
