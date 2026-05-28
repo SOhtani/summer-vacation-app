@@ -1417,6 +1417,185 @@ def page_requests():
                 st.rerun()
 
 
+
+def page_personal_inputs():
+    st.header("不在・休暇入力")
+
+    uid = render_user_selector()
+    if uid is None:
+        return
+
+    user = get_user(uid)
+    st.caption(f"選択中: {user['name']}")
+
+    tab_absence, tab_vacation = st.tabs(["夏季休暇以外の不在", "夏季休暇希望"])
+
+    with tab_absence:
+        st.subheader("夏季休暇以外の不在を追加")
+        st.caption("年休、出張、学会、外勤、研究日などを入力してください。")
+
+        ns, ne = mobile_range_calendar(
+            "不在期間",
+            f"absence_{uid}",
+            None,
+            None
+        )
+
+        absence_type = st.selectbox(
+            "不在種別",
+            ["年休", "出張", "学会", "外勤", "研究日", "病休", "その他"],
+            key=f"absence_type_{uid}"
+        )
+
+        counts = st.checkbox(
+            "臨床不在としてカウントする",
+            value=True,
+            key=f"absence_counts_{uid}"
+        )
+
+        desc = st.text_input("備考", key=f"absence_desc_{uid}")
+
+        if st.button("この不在を保存", use_container_width=True, key=f"save_absence_{uid}"):
+            if ns is None or ne is None:
+                st.error("開始日と終了日を選択してください。")
+            elif ne < ns:
+                st.error("終了日は開始日以降にしてください。")
+            else:
+                add_absence(uid, ns, ne, absence_type, desc, counts)
+                st.success("不在を保存しました。")
+                st.rerun()
+
+        st.markdown("---")
+        st.subheader("登録済みの不在")
+
+        rows = get_absences(uid)
+        if not rows:
+            st.info("登録済みの不在はありません。")
+        else:
+            for r in rows:
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{r['absence_type']}**　"
+                        f"{r['start_date']} 〜 {r['end_date']}"
+                    )
+                    if r.get("description"):
+                        st.caption(f"備考: {r['description']}")
+                    st.caption(
+                        "臨床不在としてカウント: "
+                        + ("はい" if int(r["counts_as_unavailable"]) == 1 else "いいえ")
+                    )
+
+                    if st.button(
+                        "この不在を削除",
+                        key=f"delete_absence_combined_{r['id']}",
+                        use_container_width=True
+                    ):
+                        delete_absence(int(r["id"]))
+                        st.success("削除しました。")
+                        st.rerun()
+
+    with tab_vacation:
+        st.subheader("夏季休暇希望を追加")
+
+        required = int(get_setting("required_workdays"))
+        st.info(
+            f"勤務日を選択してください。複数回に分けて入力できます。"
+            f"合計{required}勤務日まで保存できます。土日と登録済み非勤務日は自動的に除外されます。"
+        )
+
+        blocks_key = f"date_blocks_{uid}"
+        if blocks_key not in st.session_state:
+            st.session_state[blocks_key] = [(None, None)]
+
+        new_blocks = []
+        selected = []
+
+        for i, (s0, e0) in enumerate(st.session_state[blocks_key]):
+            with st.container(border=True):
+                c_title, c_del = st.columns([5, 1])
+                with c_title:
+                    st.markdown(f"#### ブロック{i+1}")
+                with c_del:
+                    if len(st.session_state[blocks_key]) > 1:
+                        if st.button("削除", key=f"delete_vacation_block_{uid}_{i}"):
+                            st.session_state[blocks_key].pop(i)
+                            st.rerun()
+
+                ns, ne = mobile_range_calendar(
+                    f"ブロック{i+1} 期間",
+                    f"vacation_{uid}_block_{i}",
+                    s0,
+                    e0
+                )
+
+                new_blocks.append((ns, ne))
+
+                if ns is not None and ne is not None:
+                    block_workdays = workdays_between(ns, ne)
+                    selected.extend(block_workdays)
+
+        st.session_state[blocks_key] = new_blocks
+
+        if st.button("ブロックを追加", use_container_width=True, key=f"add_vacation_block_{uid}"):
+            st.session_state[blocks_key].append((None, None))
+            st.rerun()
+
+        selected = sorted(set(selected))
+
+        st.markdown("---")
+        st.write(f"選択中の勤務日数: {len(selected)} / {required}")
+        if selected:
+            st.write(", ".join(d.isoformat() for d in selected))
+
+        note = st.text_input("備考", key=f"vacation_note_{uid}")
+
+        if st.button("この夏季休暇希望を保存", use_container_width=True, key=f"save_vacation_{uid}"):
+            if not selected:
+                st.error("休暇日を選択してください。")
+            else:
+                ok, msg = add_or_replace_request(uid, 1, selected, note)
+                if ok:
+                    st.success(msg)
+
+                    deadline = parse_dt(get_setting("initial_deadline"))
+                    if datetime.now() > deadline:
+                        ok2, conflicts = evaluate_dates([(uid, d) for d in selected])
+                        if ok2:
+                            st.info("現時点の既存予定とのコンフリクトはありません。管理者画面で仮確定できます。")
+                        else:
+                            st.warning("既存予定とのコンフリクトがあります。")
+                            st.dataframe(conflicts, width="stretch")
+                    else:
+                        st.info("初回締切前のため、本判定は締切時点で一括実行されます。")
+                else:
+                    st.error(msg)
+
+        st.markdown("---")
+        st.subheader("登録済みの夏季休暇希望")
+
+        reqs = get_requests(uid)
+        if not reqs:
+            st.info("まだ夏季休暇希望は登録されていません。")
+        else:
+            for r in reqs:
+                dates = r.get("dates", [])
+                with st.container(border=True):
+                    st.markdown(f"**希望ID {r['id']}**　{len(dates)}勤務日")
+                    if dates:
+                        st.write(", ".join(dates))
+                    if r.get("note"):
+                        st.caption(f"備考: {r['note']}")
+
+                    if st.button(
+                        "この夏季休暇希望を削除",
+                        key=f"delete_request_combined_{r['id']}",
+                        use_container_width=True
+                    ):
+                        delete_request(int(r["id"]))
+                        st.success("削除しました。")
+                        st.rerun()
+
+
 def page_batch_review():
     st.header("締切時点の一括判定・確定")
 
@@ -1553,16 +1732,14 @@ def main():
             "管理者設定": page_admin_settings,
             "ユーザー管理": page_users,
             "レジデント役割": page_roles,
-            "既存不在入力": page_absences,
-            "夏季休暇希望入力": page_requests,
+            "不在・休暇入力": page_personal_inputs,
             "一括判定・確定": page_batch_review,
             "予定一覧": page_assignments,
             "稼働状況": page_dashboard,
         }
     else:
         pages = {
-            "既存不在入力": page_absences,
-            "夏季休暇希望入力": page_requests,
+            "不在・休暇入力": page_personal_inputs,
             "予定一覧": page_assignments,
         }
 
