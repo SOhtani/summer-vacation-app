@@ -360,29 +360,34 @@ def add_or_replace_request(user_id: int, rank: int, vacation_dates: List[date], 
     if outside:
         return False, f"対象期間外の日付が含まれています: {', '.join(d.isoformat() for d in outside)}"
 
-    if len(workdays) != required:
-        return False, f"勤務日ベースで{required}日を選択してください。現在は{len(workdays)}勤務日です。"
+    if len(workdays) < 1:
+        return False, "少なくとも1勤務日以上を選択してください。"
+
+    conn_check = connect()
+    existing_rows = conn_check.execute("""
+        SELECT rd.vacation_date
+        FROM request_patterns rp
+        JOIN request_dates rd ON rp.id = rd.pattern_id
+        WHERE rp.user_id = ?
+    """, (user_id,)).fetchall()
+    conn_check.close()
+
+    existing_dates = {parse_date(row["vacation_date"]) for row in existing_rows}
+    total_dates = existing_dates | set(workdays)
+
+    if len(total_dates) > required:
+        return False, (
+            f"このユーザーの希望休暇日が合計{len(total_dates)}勤務日になります。"
+            f"上限は{required}勤務日です。既存の希望を削除または短縮してください。"
+        )
 
     conn = connect()
-    existing = conn.execute(
-        "SELECT id FROM request_patterns WHERE user_id = ? AND preference_rank = ?",
-        (user_id, rank)
-    ).fetchone()
     now = datetime.now().isoformat(timespec="seconds")
-    if existing:
-        pattern_id = existing["id"]
-        conn.execute("""
-            UPDATE request_patterns
-            SET status=?, updated_at=?, note=?
-            WHERE id=?
-        """, (STATUS_SUBMITTED, now, note, pattern_id))
-        conn.execute("DELETE FROM request_dates WHERE pattern_id = ?", (pattern_id,))
-    else:
-        cur = conn.execute("""
-            INSERT INTO request_patterns(user_id, preference_rank, status, submitted_at, updated_at, note)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (user_id, rank, STATUS_SUBMITTED, now, now, note))
-        pattern_id = cur.lastrowid
+    cur = conn.execute("""
+        INSERT INTO request_patterns(user_id, preference_rank, status, submitted_at, updated_at, note)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (user_id, rank, STATUS_SUBMITTED, now, now, note))
+    pattern_id = cur.lastrowid
 
     for d in workdays:
         conn.execute(
@@ -391,7 +396,8 @@ def add_or_replace_request(user_id: int, rank: int, vacation_dates: List[date], 
         )
     conn.commit()
     conn.close()
-    return True, "保存しました。"
+    return True, f"保存しました。このユーザーの希望休暇日は合計{len(total_dates)}勤務日です。"
+
 
 
 def get_requests(user_id: Optional[int] = None) -> List[Dict]:
@@ -868,6 +874,145 @@ def calendar_date_picker(label: str, key: str, default: date) -> date:
 
 
 
+
+def render_month_preview(year: int, month: int, selected_dates: List[date]) -> None:
+    selected_set = set(selected_dates)
+    non_working = get_non_working_days()
+
+    first = date(year, month, 1)
+    if month == 12:
+        last = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+
+    days = []
+    for _ in range(first.weekday()):
+        days.append(None)
+
+    d = first
+    while d <= last:
+        days.append(d)
+        d += timedelta(days=1)
+
+    while len(days) % 7 != 0:
+        days.append(None)
+
+    html = """
+    <style>
+    .cal-table {border-collapse: collapse; width: 100%; table-layout: fixed; margin-top: 8px;}
+    .cal-table th {text-align: center; padding: 6px; font-size: 13px; color: #555;}
+    .cal-table td {height: 42px; text-align: center; vertical-align: middle; border: 1px solid #eee; border-radius: 6px;}
+    .cal-workday {background: #ffffff;}
+    .cal-sat {background: #e8f1ff; color: #2457a6;}
+    .cal-sun {background: #ffecec; color: #b42318;}
+    .cal-holiday {background: #ffe2e2; color: #b42318; font-weight: 700;}
+    .cal-selected {background: #d9fbe5 !important; color: #046c4e !important; font-weight: 800; border: 2px solid #22c55e !important;}
+    .cal-empty {background: #fafafa;}
+    .cal-small {font-size: 10px; display:block; opacity:0.8;}
+    </style>
+    <table class="cal-table">
+    <tr><th>月</th><th>火</th><th>水</th><th>木</th><th>金</th><th>土</th><th>日</th></tr>
+    """
+
+    for i in range(0, len(days), 7):
+        html += "<tr>"
+        for d in days[i:i+7]:
+            if d is None:
+                html += '<td class="cal-empty"></td>'
+                continue
+
+            cls = "cal-workday"
+            label = str(d.day)
+            sub = ""
+
+            if d.weekday() == 5:
+                cls = "cal-sat"
+                sub = "土"
+            if d.weekday() == 6:
+                cls = "cal-sun"
+                sub = "日"
+            if d in non_working:
+                cls = "cal-holiday"
+                sub = "祝"
+            if d in selected_set:
+                cls += " cal-selected"
+                sub = "選択"
+
+            html += f'<td class="{cls}">{label}<span class="cal-small">{sub}</span></td>'
+        html += "</tr>"
+
+    html += "</table>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
+
+def select_date_with_colored_calendar(label: str, key: str, default: date) -> date:
+    st.markdown(f"**{label}**")
+
+    if f"{key}_selected" not in st.session_state:
+        st.session_state[f"{key}_selected"] = default
+
+    selected = st.session_state[f"{key}_selected"]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        year = st.selectbox(
+            "年",
+            list(range(2026, 2028)),
+            index=list(range(2026, 2028)).index(selected.year) if selected.year in range(2026, 2028) else 0,
+            key=f"{key}_year",
+        )
+    with c2:
+        month = st.selectbox(
+            "月",
+            list(range(1, 13)),
+            index=selected.month - 1,
+            key=f"{key}_month",
+        )
+
+    first = date(year, month, 1)
+    last = date(year + 1, 1, 1) - timedelta(days=1) if month == 12 else date(year, month + 1, 1) - timedelta(days=1)
+
+    non_working = get_non_working_days()
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+
+    cols = st.columns(7)
+    for i, w in enumerate(weekdays):
+        cols[i].markdown(f"<div style='text-align:center;font-weight:bold'>{w}</div>", unsafe_allow_html=True)
+
+    days = [None] * first.weekday()
+    d = first
+    while d <= last:
+        days.append(d)
+        d += timedelta(days=1)
+    while len(days) % 7 != 0:
+        days.append(None)
+
+    for week_start in range(0, len(days), 7):
+        cols = st.columns(7)
+        for i, d in enumerate(days[week_start:week_start + 7]):
+            if d is None:
+                cols[i].markdown(" ")
+                continue
+
+            if d == selected:
+                text = f"✅ {d.day}"
+            elif d in non_working:
+                text = f"祝 {d.day}"
+            elif d.weekday() == 5:
+                text = f"土 {d.day}"
+            elif d.weekday() == 6:
+                text = f"日 {d.day}"
+            else:
+                text = str(d.day)
+
+            if cols[i].button(text, key=f"{key}_{d.isoformat()}"):
+                st.session_state[f"{key}_selected"] = d
+                st.rerun()
+
+    return st.session_state[f"{key}_selected"]
+
+
 def page_admin_settings():
     st.header("管理者設定")
 
@@ -1043,75 +1188,114 @@ def page_requests():
         return
 
     required = int(get_setting("required_workdays"))
-    st.info(f"第1〜第5希望として、それぞれ合計{required}勤務日を選択してください。土日と登録済み非勤務日は自動的に除外されます。")
+    st.info(
+        f"勤務日を選択してください。複数回に分けて入力できます。"
+        f"合計{required}勤務日まで保存できます。土日と登録済み非勤務日は自動的に除外されます。"
+    )
 
-    rank = st.selectbox("希望順位", [1, 2, 3, 4, 5])
-    st.caption("複数ブロックを追加できます。例：8/3〜8/7 + 9/7〜9/11。合計勤務日数が10日になる必要があります。")
+    rank = 1
+
+    st.subheader("休暇ブロックを追加")
 
     if "date_blocks" not in st.session_state:
         st.session_state.date_blocks = [(date.today(), date.today())]
 
     new_blocks = []
-    for i, (s, e) in enumerate(st.session_state.date_blocks):
-        c1, c2 = st.columns(2)
-        with c1:
-            ns = st.date_input(f"ブロック{i+1}開始", s, key=f"block_s_{i}")
-        with c2:
-            ne = st.date_input(f"ブロック{i+1}終了", e, key=f"block_e_{i}")
+    selected = []
 
-        block_workdays = workdays_between(ns, ne)
-        st.caption(
-            f"ブロック{i+1}: {len(block_workdays)}勤務日 "
-            f"（土日・登録済み非勤務日は除外）"
-        )
-        new_blocks.append((ns, ne))
+    for i, (s0, e0) in enumerate(st.session_state.date_blocks):
+        with st.container(border=True):
+            c_title, c_del = st.columns([5, 1])
+            with c_title:
+                st.markdown(f"#### ブロック{i+1}")
+            with c_del:
+                if len(st.session_state.date_blocks) > 1:
+                    if st.button("削除", key=f"delete_block_{i}"):
+                        st.session_state.date_blocks.pop(i)
+                        st.rerun()
+
+            c_start, c_end = st.columns(2)
+            with c_start:
+                ns = select_date_with_colored_calendar(
+                    f"ブロック{i+1} 開始日",
+                    f"block_{i}_start",
+                    s0
+                )
+            with c_end:
+                ne = select_date_with_colored_calendar(
+                    f"ブロック{i+1} 終了日",
+                    f"block_{i}_end",
+                    e0
+                )
+
+            if ne < ns:
+                ne = ns
+                st.session_state[f"block_{i}_end_selected"] = ns
+
+            new_blocks.append((ns, ne))
+
+            block_workdays = workdays_between(ns, ne)
+            selected.extend(block_workdays)
+
+            st.caption(
+                f"{ns.isoformat()} 〜 {ne.isoformat()} / "
+                f"{len(block_workdays)}勤務日（土日・登録済み非勤務日は除外）"
+            )
+
     st.session_state.date_blocks = new_blocks
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("ブロックを追加"):
-            st.session_state.date_blocks.append((date.today(), date.today()))
-            st.rerun()
-    with c2:
-        if st.button("最後のブロックを削除") and len(st.session_state.date_blocks) > 1:
-            st.session_state.date_blocks.pop()
-            st.rerun()
+    if st.button("ブロックを追加"):
+        st.session_state.date_blocks.append((date.today(), date.today()))
+        st.rerun()
 
-    selected = []
-    for s, e in st.session_state.date_blocks:
-        selected.extend(workdays_between(s, e))
     selected = sorted(set(selected))
+
+    st.markdown("---")
     st.write(f"選択中の勤務日数: {len(selected)} / {required}")
-    st.write(", ".join(d.isoformat() for d in selected))
+    if selected:
+        st.write(", ".join(d.isoformat() for d in selected))
 
     note = st.text_input("備考")
-    if st.button("この希望順位で保存"):
+
+    if st.button("保存"):
         ok, msg = add_or_replace_request(uid, int(rank), selected, note)
         if ok:
             st.success(msg)
 
             deadline = parse_dt(get_setting("initial_deadline"))
             if datetime.now() > deadline:
-                # After deadline: evaluate immediately against existing fixed schedules.
                 ok2, conflicts = evaluate_dates([(uid, d) for d in selected])
                 if ok2:
                     st.info("現時点の既存予定とのコンフリクトはありません。管理者画面で仮確定できます。")
                 else:
                     st.warning("既存予定とのコンフリクトがあります。")
-                    st.dataframe(conflicts, use_container_width=True)
+                    st.dataframe(conflicts, width="stretch")
             else:
                 st.info("初回締切前のため、本判定は締切時点で一括実行されます。")
         else:
             st.error(msg)
 
+    st.markdown("---")
     st.subheader("自分の希望一覧")
+
     reqs = get_requests(uid)
-    if reqs:
-        st.dataframe(reqs, use_container_width=True)
-        pid = st.number_input("削除するpattern id", min_value=0, step=1)
-        if st.button("希望を削除"):
-            delete_request(int(pid))
-            st.success("削除しました。")
+    if not reqs:
+        st.info("まだ希望は登録されていません。")
+        return
+
+    for r in reqs:
+        dates = r.get("dates", [])
+        with st.container(border=True):
+            st.markdown(f"**希望ID {r['id']}**　{len(dates)}勤務日")
+            if dates:
+                st.write(", ".join(dates))
+            if r.get("note"):
+                st.caption(f"備考: {r['note']}")
+
+            if st.button("この希望を削除", key=f"delete_request_{r['id']}"):
+                delete_request(int(r["id"]))
+                st.success("削除しました。")
+                st.rerun()
 
 
 def page_batch_review():
