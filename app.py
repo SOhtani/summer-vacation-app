@@ -786,8 +786,17 @@ def render_user_selector(label: str = "ユーザー") -> Optional[int]:
     if not users:
         st.warning("ユーザーが登録されていません。")
         return None
-    options = {f'{u["name"]} ({u["category"]})': u["id"] for u in users}
-    return options[st.selectbox(label, list(options.keys()))]
+
+    options = {"選択してください": None}
+    options.update({f'{u["name"]} ({u["category"]})': u["id"] for u in users})
+
+    selected = st.selectbox(label, list(options.keys()), index=0)
+
+    if options[selected] is None:
+        st.info("まずユーザーを選択してください。")
+        return None
+
+    return options[selected]
 
 
 
@@ -1013,6 +1022,223 @@ def select_date_with_colored_calendar(label: str, key: str, default: date) -> da
     return st.session_state[f"{key}_selected"]
 
 
+
+def compact_date_selector(label: str, key: str, default: date) -> date:
+    st.markdown(f"**{label}**")
+
+    season_start = parse_date(get_setting("season_start"))
+    season_end = parse_date(get_setting("season_end"))
+
+    years = list(range(season_start.year, season_end.year + 1))
+
+    if f"{key}_year" not in st.session_state:
+        st.session_state[f"{key}_year"] = default.year
+    if f"{key}_month" not in st.session_state:
+        st.session_state[f"{key}_month"] = default.month
+    if f"{key}_day" not in st.session_state:
+        st.session_state[f"{key}_day"] = default.day
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        year = st.selectbox(
+            "年",
+            years,
+            index=years.index(st.session_state[f"{key}_year"]) if st.session_state[f"{key}_year"] in years else 0,
+            key=f"{key}_year_select",
+        )
+
+    with c2:
+        month = st.selectbox(
+            "月",
+            list(range(1, 13)),
+            index=st.session_state[f"{key}_month"] - 1,
+            key=f"{key}_month_select",
+        )
+
+    if month == 12:
+        last_day = 31
+    else:
+        last_day = (date(year, month + 1, 1) - timedelta(days=1)).day
+
+    day_default = min(st.session_state[f"{key}_day"], last_day)
+
+    with c3:
+        day = st.selectbox(
+            "日",
+            list(range(1, last_day + 1)),
+            index=day_default - 1,
+            key=f"{key}_day_select",
+        )
+
+    selected = date(year, month, day)
+
+    st.session_state[f"{key}_year"] = year
+    st.session_state[f"{key}_month"] = month
+    st.session_state[f"{key}_day"] = day
+
+    non_working = get_non_working_days()
+    if selected.weekday() >= 5:
+        st.warning(f"{selected.isoformat()} は土日です。勤務日数には含まれません。")
+    elif selected in non_working:
+        st.warning(f"{selected.isoformat()} は登録済み非勤務日です。勤務日数には含まれません。")
+    else:
+        st.success(f"{selected.isoformat()} は勤務日です。")
+
+    return selected
+
+
+
+def mobile_range_calendar(label: str, key: str, default_start: date, default_end: date) -> Tuple[date, date]:
+    st.markdown(f"**{label}**")
+
+    season_start = parse_date(get_setting("season_start"))
+    season_end = parse_date(get_setting("season_end"))
+    non_working = get_non_working_days()
+
+    start_key = f"{key}_start"
+    end_key = f"{key}_end"
+    ym_key = f"{key}_ym"
+
+    if start_key not in st.session_state:
+        st.session_state[start_key] = default_start
+    if end_key not in st.session_state:
+        st.session_state[end_key] = default_end
+    if ym_key not in st.session_state:
+        st.session_state[ym_key] = date(default_start.year, default_start.month, 1)
+
+    month_base = st.session_state[ym_key]
+
+    c_prev, c_title, c_next = st.columns([1, 3, 1])
+    with c_prev:
+        if st.button("‹", key=f"{key}_prev"):
+            y = month_base.year
+            m = month_base.month - 1
+            if m == 0:
+                y -= 1
+                m = 12
+            new_month = date(y, m, 1)
+            if new_month >= date(season_start.year, season_start.month, 1):
+                st.session_state[ym_key] = new_month
+            st.rerun()
+
+    with c_title:
+        st.markdown(
+            f"<div style='text-align:center;font-weight:700;font-size:1.05rem'>{month_base.year}年 {month_base.month}月</div>",
+            unsafe_allow_html=True
+        )
+
+    with c_next:
+        if st.button("›", key=f"{key}_next"):
+            y = month_base.year
+            m = month_base.month + 1
+            if m == 13:
+                y += 1
+                m = 1
+            new_month = date(y, m, 1)
+            if new_month <= date(season_end.year, season_end.month, 1):
+                st.session_state[ym_key] = new_month
+            st.rerun()
+
+    st.caption("1回目で開始日、2回目で終了日を選択。🔵土曜、🔴日曜・祝日、🟩選択範囲。")
+
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    header_cols = st.columns(7)
+    for i, w in enumerate(weekdays):
+        header_cols[i].markdown(
+            f"<div style='text-align:center;font-weight:700;font-size:0.85rem'>{w}</div>",
+            unsafe_allow_html=True
+        )
+
+    first = month_base
+    if first.month == 12:
+        last = date(first.year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(first.year, first.month + 1, 1) - timedelta(days=1)
+
+    days = [None] * first.weekday()
+    d = first
+    while d <= last:
+        days.append(d)
+        d += timedelta(days=1)
+    while len(days) % 7 != 0:
+        days.append(None)
+
+    current_start = st.session_state[start_key]
+    current_end = st.session_state[end_key]
+
+    if current_end < current_start:
+        current_end = current_start
+        st.session_state[end_key] = current_start
+
+    for week_start in range(0, len(days), 7):
+        cols = st.columns(7)
+        for i, d in enumerate(days[week_start:week_start + 7]):
+            if d is None:
+                cols[i].markdown(" ")
+                continue
+
+            in_range = current_start <= d <= current_end
+            is_holiday = d in non_working
+            is_saturday = d.weekday() == 5
+            is_sunday = d.weekday() == 6
+            outside_season = d < season_start or d > season_end
+
+            if outside_season:
+                label_text = f"· {d.day}"
+            elif in_range:
+                label_text = f"🟩 {d.day}"
+            elif is_holiday:
+                label_text = f"🔴祝 {d.day}"
+            elif is_sunday:
+                label_text = f"🔴 {d.day}"
+            elif is_saturday:
+                label_text = f"🔵 {d.day}"
+            else:
+                label_text = f"　{d.day}"
+
+            disabled = outside_season
+
+            if cols[i].button(label_text, key=f"{key}_{d.isoformat()}", disabled=disabled, use_container_width=True):
+                s0 = st.session_state[start_key]
+                e0 = st.session_state[end_key]
+
+                # まだ単日選択状態なら、次のクリックを終了日にする
+                if s0 == e0:
+                    if d >= s0:
+                        st.session_state[end_key] = d
+                    else:
+                        st.session_state[start_key] = d
+                        st.session_state[end_key] = d
+                else:
+                    # すでに範囲がある場合は、新しい開始日として選び直す
+                    st.session_state[start_key] = d
+                    st.session_state[end_key] = d
+
+                st.rerun()
+
+    ns = st.session_state[start_key]
+    ne = st.session_state[end_key]
+
+    if ne < ns:
+        ne = ns
+        st.session_state[end_key] = ns
+
+    workdays = workdays_between(ns, ne)
+
+    st.markdown(
+        f"**選択範囲:** {ns.isoformat()} 〜 {ne.isoformat()} / "
+        f"**{len(workdays)}勤務日**（土日・登録済み非勤務日は除外）"
+    )
+
+    if ns.weekday() >= 5 or ns in non_working:
+        st.warning("開始日は非勤務日です。勤務日数には含まれません。")
+    if ne.weekday() >= 5 or ne in non_working:
+        st.warning("終了日は非勤務日です。勤務日数には含まれません。")
+
+    return ns, ne
+
+
 def page_admin_settings():
     st.header("管理者設定")
 
@@ -1198,7 +1424,8 @@ def page_requests():
     st.subheader("休暇ブロックを追加")
 
     if "date_blocks" not in st.session_state:
-        st.session_state.date_blocks = [(date.today(), date.today())]
+        today = date.today()
+        st.session_state.date_blocks = [(today, today)]
 
     new_blocks = []
     selected = []
@@ -1212,40 +1439,27 @@ def page_requests():
                 if len(st.session_state.date_blocks) > 1:
                     if st.button("削除", key=f"delete_block_{i}"):
                         st.session_state.date_blocks.pop(i)
+
+                        # 削除後に古い選択状態が残っても実害はないが、画面を即更新する
                         st.rerun()
 
-            c_start, c_end = st.columns(2)
-            with c_start:
-                ns = select_date_with_colored_calendar(
-                    f"ブロック{i+1} 開始日",
-                    f"block_{i}_start",
-                    s0
-                )
-            with c_end:
-                ne = select_date_with_colored_calendar(
-                    f"ブロック{i+1} 終了日",
-                    f"block_{i}_end",
-                    e0
-                )
-
-            if ne < ns:
-                ne = ns
-                st.session_state[f"block_{i}_end_selected"] = ns
+            ns, ne = mobile_range_calendar(
+                f"ブロック{i+1} 期間",
+                f"block_{i}",
+                s0,
+                e0
+            )
 
             new_blocks.append((ns, ne))
 
             block_workdays = workdays_between(ns, ne)
             selected.extend(block_workdays)
 
-            st.caption(
-                f"{ns.isoformat()} 〜 {ne.isoformat()} / "
-                f"{len(block_workdays)}勤務日（土日・登録済み非勤務日は除外）"
-            )
-
     st.session_state.date_blocks = new_blocks
 
-    if st.button("ブロックを追加"):
-        st.session_state.date_blocks.append((date.today(), date.today()))
+    if st.button("ブロックを追加", use_container_width=True):
+        today = date.today()
+        st.session_state.date_blocks.append((today, today))
         st.rerun()
 
     selected = sorted(set(selected))
@@ -1257,7 +1471,7 @@ def page_requests():
 
     note = st.text_input("備考")
 
-    if st.button("保存"):
+    if st.button("保存", use_container_width=True):
         ok, msg = add_or_replace_request(uid, int(rank), selected, note)
         if ok:
             st.success(msg)
@@ -1292,7 +1506,7 @@ def page_requests():
             if r.get("note"):
                 st.caption(f"備考: {r['note']}")
 
-            if st.button("この希望を削除", key=f"delete_request_{r['id']}"):
+            if st.button("この希望を削除", key=f"delete_request_{r['id']}", use_container_width=True):
                 delete_request(int(r["id"]))
                 st.success("削除しました。")
                 st.rerun()
