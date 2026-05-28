@@ -1089,7 +1089,7 @@ def compact_date_selector(label: str, key: str, default: date) -> date:
 
 
 
-def mobile_range_calendar(label: str, key: str, default_start: date, default_end: date) -> Tuple[date, date]:
+def mobile_range_calendar(label: str, key: str, default_start: Optional[date], default_end: Optional[date]) -> Tuple[Optional[date], Optional[date]]:
     st.markdown(f"**{label}**")
 
     season_start = parse_date(get_setting("season_start"))
@@ -1105,7 +1105,8 @@ def mobile_range_calendar(label: str, key: str, default_start: date, default_end
     if end_key not in st.session_state:
         st.session_state[end_key] = default_end
     if ym_key not in st.session_state:
-        st.session_state[ym_key] = date(default_start.year, default_start.month, 1)
+        # 初期表示月は対象期間の開始月。日付は未選択。
+        st.session_state[ym_key] = date(season_start.year, season_start.month, 1)
 
     month_base = st.session_state[ym_key]
 
@@ -1167,7 +1168,7 @@ def mobile_range_calendar(label: str, key: str, default_start: date, default_end
     current_start = st.session_state[start_key]
     current_end = st.session_state[end_key]
 
-    if current_end < current_start:
+    if current_start is not None and current_end is not None and current_end < current_start:
         current_end = current_start
         st.session_state[end_key] = current_start
 
@@ -1178,11 +1179,16 @@ def mobile_range_calendar(label: str, key: str, default_start: date, default_end
                 cols[i].markdown(" ")
                 continue
 
-            in_range = current_start <= d <= current_end
+            outside_season = d < season_start or d > season_end
             is_holiday = d in non_working
             is_saturday = d.weekday() == 5
             is_sunday = d.weekday() == 6
-            outside_season = d < season_start or d > season_end
+
+            in_range = False
+            if current_start is not None and current_end is None:
+                in_range = d == current_start
+            elif current_start is not None and current_end is not None:
+                in_range = current_start <= d <= current_end
 
             if outside_season:
                 label_text = f"· {d.day}"
@@ -1197,28 +1203,38 @@ def mobile_range_calendar(label: str, key: str, default_start: date, default_end
             else:
                 label_text = f"　{d.day}"
 
-            disabled = outside_season
-
-            if cols[i].button(label_text, key=f"{key}_{d.isoformat()}", disabled=disabled, use_container_width=True):
+            if cols[i].button(label_text, key=f"{key}_{d.isoformat()}", disabled=outside_season, use_container_width=True):
                 s0 = st.session_state[start_key]
                 e0 = st.session_state[end_key]
 
-                # まだ単日選択状態なら、次のクリックを終了日にする
-                if s0 == e0:
+                if s0 is None:
+                    # 1回目：開始日を選択
+                    st.session_state[start_key] = d
+                    st.session_state[end_key] = None
+                elif e0 is None:
+                    # 2回目：終了日を選択。開始日より前なら開始日を選び直し。
                     if d >= s0:
                         st.session_state[end_key] = d
                     else:
                         st.session_state[start_key] = d
-                        st.session_state[end_key] = d
+                        st.session_state[end_key] = None
                 else:
-                    # すでに範囲がある場合は、新しい開始日として選び直す
+                    # 既に範囲選択済みなら、新しい開始日として選び直し。
                     st.session_state[start_key] = d
-                    st.session_state[end_key] = d
+                    st.session_state[end_key] = None
 
                 st.rerun()
 
     ns = st.session_state[start_key]
     ne = st.session_state[end_key]
+
+    if ns is None:
+        st.info("開始日を選択してください。")
+        return None, None
+
+    if ne is None:
+        st.info(f"開始日: {ns.isoformat()}。次に終了日を選択してください。")
+        return ns, None
 
     if ne < ns:
         ne = ns
@@ -1239,141 +1255,6 @@ def mobile_range_calendar(label: str, key: str, default_start: date, default_end
     return ns, ne
 
 
-def page_admin_settings():
-    st.header("管理者設定")
-
-    st.subheader("基本設定")
-    c1, c2 = st.columns(2)
-    with c1:
-        season_start = st.date_input("対象開始日", parse_date(get_setting("season_start")))
-        required_workdays = st.number_input("必要休暇日数（勤務日）", min_value=1, max_value=30, value=int(get_setting("required_workdays")))
-        staff_max_off = st.number_input("スタッフ同日不在上限", min_value=0, max_value=10, value=int(get_setting("staff_max_off")))
-        min_chief = st.number_input("チーフ最低人数", min_value=0, max_value=10, value=int(get_setting("min_chief")))
-    with c2:
-        season_end = st.date_input("対象終了日", parse_date(get_setting("season_end")))
-        deadline_text = st.text_input("初回締切（YYYY-MM-DD HH:MM）", get_setting("initial_deadline"))
-        min_chief_clinical = st.number_input("チーフ＋臨床レジデント最低人数", min_value=0, max_value=20, value=int(get_setting("min_chief_clinical")))
-        min_total_residents = st.number_input("チーフ＋臨床＋病理レジデント最低人数", min_value=0, max_value=20, value=int(get_setting("min_total_residents")))
-
-    if st.button("基本設定を保存"):
-        try:
-            parse_dt(deadline_text)
-            set_setting("season_start", season_start.isoformat())
-            set_setting("season_end", season_end.isoformat())
-            set_setting("required_workdays", str(required_workdays))
-            set_setting("initial_deadline", deadline_text)
-            set_setting("staff_max_off", str(staff_max_off))
-            set_setting("min_chief", str(min_chief))
-            set_setting("min_chief_clinical", str(min_chief_clinical))
-            set_setting("min_total_residents", str(min_total_residents))
-            st.success("保存しました。")
-        except ValueError:
-            st.error("締切日時の形式が不正です。例: 2026-06-15 23:59")
-
-    st.subheader("非勤務日設定")
-    st.caption("土日は自動的に非勤務日です。祝日・年末年始などを追加してください。")
-    hdate = st.date_input("追加する非勤務日", date.today())
-    hlabel = st.text_input("ラベル", "祝日")
-    if st.button("非勤務日を追加"):
-        conn = connect()
-        try:
-            conn.execute("INSERT OR IGNORE INTO non_working_days(holiday_date, label) VALUES (?, ?)", (hdate.isoformat(), hlabel))
-            conn.commit()
-            st.success("追加しました。")
-        finally:
-            conn.close()
-
-    conn = connect()
-    hrows = rows_to_dicts(conn.execute("SELECT * FROM non_working_days ORDER BY holiday_date").fetchall())
-    conn.close()
-    if hrows:
-        st.dataframe(hrows, use_container_width=True)
-
-    st.subheader("通知設定")
-    slack_url = st.text_input("Slack Incoming Webhook URL", get_setting("slack_webhook_url"), type="password")
-    smtp_host = st.text_input("SMTP host", get_setting("smtp_host"))
-    smtp_port = st.text_input("SMTP port", get_setting("smtp_port"))
-    smtp_user = st.text_input("SMTP user", get_setting("smtp_user"))
-    smtp_password = st.text_input("SMTP password", get_setting("smtp_password"), type="password")
-    mail_from = st.text_input("From email", get_setting("mail_from"))
-
-    if st.button("通知設定を保存"):
-        set_setting("slack_webhook_url", slack_url)
-        set_setting("smtp_host", smtp_host)
-        set_setting("smtp_port", smtp_port)
-        set_setting("smtp_user", smtp_user)
-        set_setting("smtp_password", smtp_password)
-        set_setting("mail_from", mail_from)
-        st.success("通知設定を保存しました。")
-
-
-def page_users():
-    st.header("ユーザー管理")
-
-    with st.expander("ユーザー追加", expanded=True):
-        name = st.text_input("氏名")
-        category = st.selectbox("区分", [USER_STAFF, USER_RESIDENT], format_func=lambda x: "スタッフ" if x == USER_STAFF else "レジデント")
-        email = st.text_input("メール")
-        slack_id = st.text_input("Slack ID（任意）")
-        if st.button("ユーザー追加"):
-            if not name.strip():
-                st.error("氏名を入力してください。")
-            else:
-                add_user(name.strip(), category, email.strip(), slack_id.strip())
-                st.success("追加しました。")
-
-    users = get_users(active_only=True)
-    st.subheader("有効ユーザー")
-    if users:
-        st.dataframe(users, use_container_width=True)
-
-    st.subheader("ユーザー編集")
-    if users:
-        options = {f'{u["id"]}: {u["name"]} ({u["category"]})': u["id"] for u in users}
-        uid = options[st.selectbox("編集対象", list(options.keys()))]
-        u = get_user(uid)
-        new_name = st.text_input("氏名", u["name"], key="edit_name")
-        new_category = st.selectbox("区分", [USER_STAFF, USER_RESIDENT], index=[USER_STAFF, USER_RESIDENT].index(u["category"]), key="edit_cat")
-        new_email = st.text_input("メール", u["email"] or "", key="edit_mail")
-        new_slack = st.text_input("Slack ID", u["slack_id"] or "", key="edit_slack")
-        new_active = st.checkbox("有効", value=bool(u["active"]))
-        if st.button("更新"):
-            update_user(uid, new_name, new_category, new_email, new_slack, new_active)
-            st.success("更新しました。")
-
-
-def page_roles():
-    st.header("レジデント期間別役割")
-    uid = render_user_selector("レジデント")
-    if uid is None:
-        return
-    user = get_user(uid)
-    if user["category"] != USER_RESIDENT:
-        st.warning("選択されたユーザーはレジデントではありません。")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        start = st.date_input("開始日", parse_date(get_setting("season_start")))
-    with c2:
-        end = st.date_input("終了日", parse_date(get_setting("season_end")))
-    with c3:
-        role = st.selectbox("役割", [ROLE_CHIEF, ROLE_CLINICAL, ROLE_PATHOLOGY],
-                            format_func=lambda x: {"chief": "チーフ", "clinical": "臨床レジデント", "pathology": "病理レジデント"}[x])
-
-    if st.button("役割期間を追加"):
-        if end < start:
-            st.error("終了日は開始日以降にしてください。")
-        else:
-            add_role(uid, start, end, role)
-            st.success("追加しました。")
-
-    roles = get_roles(uid)
-    if roles:
-        st.dataframe(roles, use_container_width=True)
-        rid = st.number_input("削除するrole id", min_value=0, step=1)
-        if st.button("役割期間を削除"):
-            delete_role(int(rid))
-            st.success("削除しました。")
 
 
 def page_absences():
@@ -1382,29 +1263,54 @@ def page_absences():
     if uid is None:
         return
 
+    st.subheader("不在を追加")
+
     c1, c2 = st.columns(2)
     with c1:
-        start = st.date_input("不在開始日", date.today())
+        start = st.date_input("不在開始日", date.today(), key="absence_start")
     with c2:
-        end = st.date_input("不在終了日", date.today())
+        end = st.date_input("不在終了日", date.today(), key="absence_end")
 
-    absence_type = st.selectbox("不在種別", ["年休", "出張", "学会", "外勤", "研究日", "病休", "その他"])
+    absence_type = st.selectbox(
+        "不在種別",
+        ["年休", "出張", "学会", "外勤", "研究日", "病休", "その他"]
+    )
     counts = st.checkbox("臨床不在としてカウントする", value=True)
     desc = st.text_input("備考")
-    if st.button("不在を追加"):
+
+    if st.button("不在を追加", use_container_width=True):
         if end < start:
             st.error("終了日は開始日以降にしてください。")
         else:
             add_absence(uid, start, end, absence_type, desc, counts)
             st.success("追加しました。")
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("自分の不在一覧")
 
     rows = get_absences(uid)
-    if rows:
-        st.dataframe(rows, use_container_width=True)
-        aid = st.number_input("削除するabsence id", min_value=0, step=1)
-        if st.button("不在を削除"):
-            delete_absence(int(aid))
-            st.success("削除しました。")
+    if not rows:
+        st.info("登録済みの不在はありません。")
+        return
+
+    for r in rows:
+        with st.container(border=True):
+            st.markdown(
+                f"**{r['absence_type']}**　"
+                f"{r['start_date']} 〜 {r['end_date']}"
+            )
+            if r.get("description"):
+                st.caption(f"備考: {r['description']}")
+            st.caption(
+                "臨床不在としてカウント: "
+                + ("はい" if int(r["counts_as_unavailable"]) == 1 else "いいえ")
+            )
+
+            if st.button("この不在を削除", key=f"delete_absence_{r['id']}", use_container_width=True):
+                delete_absence(int(r["id"]))
+                st.success("削除しました。")
+                st.rerun()
 
 
 def page_requests():
@@ -1424,8 +1330,7 @@ def page_requests():
     st.subheader("休暇ブロックを追加")
 
     if "date_blocks" not in st.session_state:
-        today = date.today()
-        st.session_state.date_blocks = [(today, today)]
+        st.session_state.date_blocks = [(None, None)]
 
     new_blocks = []
     selected = []
@@ -1452,14 +1357,14 @@ def page_requests():
 
             new_blocks.append((ns, ne))
 
-            block_workdays = workdays_between(ns, ne)
-            selected.extend(block_workdays)
+            if ns is not None and ne is not None:
+                block_workdays = workdays_between(ns, ne)
+                selected.extend(block_workdays)
 
     st.session_state.date_blocks = new_blocks
 
     if st.button("ブロックを追加", use_container_width=True):
-        today = date.today()
-        st.session_state.date_blocks.append((today, today))
+        st.session_state.date_blocks.append((None, None))
         st.rerun()
 
     selected = sorted(set(selected))
