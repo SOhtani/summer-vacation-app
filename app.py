@@ -9,6 +9,8 @@ from email.mime.text import MIMEText
 import urllib.request
 import urllib.error
 import json
+import csv
+import io
 import jpholiday
 
 DB_PATH = Path("summer_vacation.db")
@@ -2000,6 +2002,97 @@ def page_roles():
         else:
             add_role(uid, start, end, role)
             st.success("追加しました。")
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("レジデント役割CSVインポート")
+
+    st.caption("CSV形式: name,start_date,end_date,role。roleは chief / clinical / pathology のいずれか。")
+
+    uploaded = st.file_uploader(
+        "resident_roles_export.csv をアップロード",
+        type=["csv"],
+        key="resident_roles_csv_upload"
+    )
+
+    if uploaded is not None:
+        if st.button("CSVから役割をインポート", use_container_width=True):
+            text = uploaded.getvalue().decode("utf-8-sig")
+            reader = csv.DictReader(io.StringIO(text))
+
+            imported = 0
+            skipped = 0
+            errors = []
+
+            conn = connect()
+
+            for idx, row in enumerate(reader, start=2):
+                name = (row.get("name") or "").strip()
+                start_date = (row.get("start_date") or "").strip()
+                end_date = (row.get("end_date") or "").strip()
+                role = (row.get("role") or "").strip()
+
+                if not name or not start_date or not end_date or not role:
+                    skipped += 1
+                    errors.append(f"{idx}行目: 必須項目不足")
+                    continue
+
+                if role not in [ROLE_CHIEF, ROLE_CLINICAL, ROLE_PATHOLOGY]:
+                    skipped += 1
+                    errors.append(f"{idx}行目: roleが不正: {role}")
+                    continue
+
+                try:
+                    parse_date(start_date)
+                    parse_date(end_date)
+                except Exception:
+                    skipped += 1
+                    errors.append(f"{idx}行目: 日付形式が不正")
+                    continue
+
+                user_row = conn.execute(
+                    "SELECT id FROM users WHERE name = ? AND category = ? ORDER BY id LIMIT 1",
+                    (name, USER_RESIDENT)
+                ).fetchone()
+
+                if user_row:
+                    target_user_id = user_row["id"]
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO users(name, category, email, slack_id, active, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (name, USER_RESIDENT, "", "", 1, datetime.now().isoformat(timespec="seconds"))
+                    )
+                    target_user_id = cur.lastrowid
+
+                duplicate = conn.execute("""
+                    SELECT id FROM resident_roles
+                    WHERE user_id = ?
+                      AND start_date = ?
+                      AND end_date = ?
+                      AND role = ?
+                    LIMIT 1
+                """, (target_user_id, start_date, end_date, role)).fetchone()
+
+                if duplicate:
+                    skipped += 1
+                    continue
+
+                conn.execute(
+                    "INSERT INTO resident_roles(user_id, start_date, end_date, role) VALUES (?, ?, ?, ?)",
+                    (target_user_id, start_date, end_date, role)
+                )
+                imported += 1
+
+            conn.commit()
+            conn.close()
+
+            st.success(f"インポート完了: {imported}件追加、{skipped}件スキップ")
+
+            if errors:
+                with st.expander("エラー詳細"):
+                    for e in errors:
+                        st.write(e)
+
             st.rerun()
 
     st.markdown("---")
