@@ -1711,6 +1711,343 @@ def page_dashboard():
     st.dataframe(rows, use_container_width=True)
 
 
+
+def page_admin_settings():
+    st.header("管理者設定")
+
+    st.subheader("基本設定")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        season_start = st.date_input(
+            "対象開始日",
+            parse_date(get_setting("season_start")),
+            key="admin_season_start"
+        )
+        required_workdays = st.number_input(
+            "必要休暇日数（勤務日）",
+            min_value=1,
+            max_value=30,
+            value=int(get_setting("required_workdays")),
+            key="admin_required_workdays"
+        )
+        staff_max_off = st.number_input(
+            "スタッフ同日不在上限",
+            min_value=0,
+            max_value=10,
+            value=int(get_setting("staff_max_off")),
+            key="admin_staff_max_off"
+        )
+        min_chief = st.number_input(
+            "チーフ最低人数",
+            min_value=0,
+            max_value=10,
+            value=int(get_setting("min_chief")),
+            key="admin_min_chief"
+        )
+
+    with c2:
+        season_end = st.date_input(
+            "対象終了日",
+            parse_date(get_setting("season_end")),
+            key="admin_season_end"
+        )
+        deadline_text = st.text_input(
+            "初回締切（YYYY-MM-DD HH:MM）",
+            get_setting("initial_deadline"),
+            key="admin_deadline"
+        )
+        min_chief_clinical = st.number_input(
+            "チーフ＋臨床レジデント最低人数",
+            min_value=0,
+            max_value=20,
+            value=int(get_setting("min_chief_clinical")),
+            key="admin_min_chief_clinical"
+        )
+        min_total_residents = st.number_input(
+            "チーフ＋臨床＋病理レジデント最低人数",
+            min_value=0,
+            max_value=20,
+            value=int(get_setting("min_total_residents")),
+            key="admin_min_total_residents"
+        )
+
+    if st.button("基本設定を保存", use_container_width=True):
+        try:
+            parse_dt(deadline_text)
+            set_setting("season_start", season_start.isoformat())
+            set_setting("season_end", season_end.isoformat())
+            set_setting("required_workdays", str(required_workdays))
+            set_setting("initial_deadline", deadline_text)
+            set_setting("staff_max_off", str(staff_max_off))
+            set_setting("min_chief", str(min_chief))
+            set_setting("min_chief_clinical", str(min_chief_clinical))
+            set_setting("min_total_residents", str(min_total_residents))
+            st.success("基本設定を保存しました。")
+        except ValueError:
+            st.error("締切日時の形式が不正です。例：2026-06-15 23:59")
+
+    st.markdown("---")
+    st.subheader("非勤務日設定")
+    st.caption("土日は自動的に非勤務日です。祝日・年末年始などを追加できます。")
+
+    hdate = st.date_input("追加する非勤務日", date.today(), key="admin_holiday_date")
+    hlabel = st.text_input("ラベル", "祝日", key="admin_holiday_label")
+
+    if st.button("非勤務日を追加", use_container_width=True):
+        conn = connect()
+        conn.execute(
+            "INSERT OR IGNORE INTO non_working_days(holiday_date, label) VALUES (?, ?)",
+            (hdate.isoformat(), hlabel)
+        )
+        conn.commit()
+        conn.close()
+        st.success("非勤務日を追加しました。")
+        st.rerun()
+
+    conn = connect()
+    holidays = rows_to_dicts(
+        conn.execute("SELECT * FROM non_working_days ORDER BY holiday_date").fetchall()
+    )
+    conn.close()
+
+    if holidays:
+        for h in holidays:
+            with st.container(border=True):
+                st.markdown(f"**{h['holiday_date']}**　{h.get('label') or ''}")
+                if st.button(
+                    "この非勤務日を削除",
+                    key=f"delete_holiday_{h['id']}",
+                    use_container_width=True
+                ):
+                    conn = connect()
+                    conn.execute("DELETE FROM non_working_days WHERE id = ?", (h["id"],))
+                    conn.commit()
+                    conn.close()
+                    st.success("削除しました。")
+                    st.rerun()
+    else:
+        st.info("追加済みの非勤務日はありません。")
+
+    st.markdown("---")
+    st.subheader("通知設定")
+
+    slack_url = st.text_input(
+        "Slack Incoming Webhook URL",
+        get_setting("slack_webhook_url"),
+        type="password",
+        key="admin_slack_url"
+    )
+    smtp_host = st.text_input("SMTP host", get_setting("smtp_host"), key="admin_smtp_host")
+    smtp_port = st.text_input("SMTP port", get_setting("smtp_port"), key="admin_smtp_port")
+    smtp_user = st.text_input("SMTP user", get_setting("smtp_user"), key="admin_smtp_user")
+    smtp_password = st.text_input(
+        "SMTP password",
+        get_setting("smtp_password"),
+        type="password",
+        key="admin_smtp_password"
+    )
+    mail_from = st.text_input("From email", get_setting("mail_from"), key="admin_mail_from")
+
+    if st.button("通知設定を保存", use_container_width=True):
+        set_setting("slack_webhook_url", slack_url)
+        set_setting("smtp_host", smtp_host)
+        set_setting("smtp_port", smtp_port)
+        set_setting("smtp_user", smtp_user)
+        set_setting("smtp_password", smtp_password)
+        set_setting("mail_from", mail_from)
+        st.success("通知設定を保存しました。")
+
+
+
+def page_users():
+    st.header("ユーザー管理")
+
+    st.subheader("ユーザー追加")
+
+    name = st.text_input("氏名", key="user_add_name")
+    category = st.selectbox(
+        "区分",
+        [USER_STAFF, USER_RESIDENT],
+        format_func=lambda x: "スタッフ" if x == USER_STAFF else "レジデント",
+        key="user_add_category"
+    )
+    email = st.text_input("メール", key="user_add_email")
+    slack_id = st.text_input("Slack ID（任意）", key="user_add_slack")
+
+    if st.button("ユーザー追加", use_container_width=True):
+        if not name.strip():
+            st.error("氏名を入力してください。")
+        else:
+            add_user(name.strip(), category, email.strip(), slack_id.strip())
+            st.success("ユーザーを追加しました。")
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("有効ユーザー一覧")
+
+    active_users = get_users(active_only=True)
+
+    if not active_users:
+        st.info("有効ユーザーはいません。")
+    else:
+        for u in active_users:
+            with st.container(border=True):
+                st.markdown(f"**{u['name']}**　{u['category']}")
+                if u.get("email"):
+                    st.caption(f"Email: {u['email']}")
+                if u.get("slack_id"):
+                    st.caption(f"Slack: {u['slack_id']}")
+
+                c1, c2 = st.columns(2)
+
+                with c1:
+                    if st.button("無効化", key=f"deactivate_user_{u['id']}", use_container_width=True):
+                        update_user(
+                            u["id"],
+                            u["name"],
+                            u["category"],
+                            u.get("email") or "",
+                            u.get("slack_id") or "",
+                            False
+                        )
+                        st.success("無効化しました。")
+                        st.rerun()
+
+                with c2:
+                    if st.button("完全削除", key=f"delete_user_{u['id']}", use_container_width=True):
+                        conn = connect()
+
+                        pattern_rows = conn.execute(
+                            "SELECT id FROM request_patterns WHERE user_id = ?",
+                            (u["id"],)
+                        ).fetchall()
+
+                        for row in pattern_rows:
+                            conn.execute(
+                                "DELETE FROM request_dates WHERE pattern_id = ?",
+                                (row["id"],)
+                            )
+
+                        conn.execute("DELETE FROM request_patterns WHERE user_id = ?", (u["id"],))
+                        conn.execute("DELETE FROM resident_roles WHERE user_id = ?", (u["id"],))
+                        conn.execute("DELETE FROM absences WHERE user_id = ?", (u["id"],))
+                        conn.execute("DELETE FROM assignments WHERE user_id = ?", (u["id"],))
+                        conn.execute("DELETE FROM users WHERE id = ?", (u["id"],))
+
+                        conn.commit()
+                        conn.close()
+
+                        st.success("完全削除しました。")
+                        st.rerun()
+
+    st.markdown("---")
+    st.subheader("無効ユーザー一覧")
+
+    all_users = get_users(active_only=False)
+    inactive_users = [u for u in all_users if int(u["active"]) == 0]
+
+    if not inactive_users:
+        st.info("無効ユーザーはいません。")
+    else:
+        for u in inactive_users:
+            with st.container(border=True):
+                st.markdown(f"**{u['name']}**　{u['category']}")
+
+                if st.button("再有効化", key=f"reactivate_user_{u['id']}", use_container_width=True):
+                    update_user(
+                        u["id"],
+                        u["name"],
+                        u["category"],
+                        u.get("email") or "",
+                        u.get("slack_id") or "",
+                        True
+                    )
+                    st.success("再有効化しました。")
+                    st.rerun()
+
+
+
+def page_roles():
+    st.header("レジデント期間別役割")
+
+    uid = render_user_selector("レジデントを選択")
+    if uid is None:
+        return
+
+    user = get_user(uid)
+    if user["category"] != USER_RESIDENT:
+        st.warning("選択されたユーザーはレジデントではありません。")
+        return
+
+    st.caption(f"選択中: {user['name']}")
+
+    st.subheader("役割期間を追加")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        start = st.date_input(
+            "開始日",
+            parse_date(get_setting("season_start")),
+            key=f"role_start_{uid}"
+        )
+    with c2:
+        end = st.date_input(
+            "終了日",
+            parse_date(get_setting("season_end")),
+            key=f"role_end_{uid}"
+        )
+
+    role = st.selectbox(
+        "役割",
+        [ROLE_CHIEF, ROLE_CLINICAL, ROLE_PATHOLOGY],
+        format_func=lambda x: {
+            ROLE_CHIEF: "チーフ",
+            ROLE_CLINICAL: "臨床レジデント",
+            ROLE_PATHOLOGY: "病理レジデント"
+        }[x],
+        key=f"role_select_{uid}"
+    )
+
+    if st.button("役割期間を追加", use_container_width=True):
+        if end < start:
+            st.error("終了日は開始日以降にしてください。")
+        else:
+            add_role(uid, start, end, role)
+            st.success("追加しました。")
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("登録済み役割期間")
+
+    roles = get_roles(uid)
+    if not roles:
+        st.info("登録済みの役割期間はありません。")
+        return
+
+    for r in roles:
+        role_label = {
+            ROLE_CHIEF: "チーフ",
+            ROLE_CLINICAL: "臨床レジデント",
+            ROLE_PATHOLOGY: "病理レジデント"
+        }.get(r["role"], r["role"])
+
+        with st.container(border=True):
+            st.markdown(
+                f"**{role_label}**　{r['start_date']} 〜 {r['end_date']}"
+            )
+
+            if st.button(
+                "この役割期間を削除",
+                key=f"delete_role_{r['id']}",
+                use_container_width=True
+            ):
+                delete_role(int(r["id"]))
+                st.success("削除しました。")
+                st.rerun()
+
+
 def main():
     st.set_page_config(page_title="夏季休暇調整アプリ", layout="wide")
     init_db()
