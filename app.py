@@ -632,13 +632,6 @@ def evaluate_dates(assignments: List[Tuple[int, date]], run_id: Optional[str] = 
                 "detail": f"チーフ＋臨床レジデント在席が{len(clinical_present)}名です。最低{min_chief_clinical}名が必要です。",
                 "involved": absent_residents
             })
-        if len(total_present) < min_total_residents:
-            conflicts.append({
-                "date": d,
-                "type": "insufficient_total_residents",
-                "detail": f"チーフ＋臨床＋病理レジデント在席が{len(total_present)}名です。最低{min_total_residents}名が必要です。",
-                "involved": absent_residents
-            })
 
     if run_id:
         for c in conflicts:
@@ -1704,7 +1697,6 @@ def page_dashboard():
             "staff_off_names": ", ".join(user_map[i]["name"] for i in staff_off if i in user_map),
             "chief_present": chief_present,
             "chief_clinical_present": clinical_present,
-            "total_resident_present": total_res_present,
             "off_names": ", ".join(user_map[i]["name"] for i in off_ids if i in user_map)
         })
 
@@ -1765,13 +1757,6 @@ def page_admin_settings():
             value=int(get_setting("min_chief_clinical")),
             key="admin_min_chief_clinical"
         )
-        min_total_residents = st.number_input(
-            "チーフ＋臨床＋病理レジデント最低人数",
-            min_value=0,
-            max_value=20,
-            value=int(get_setting("min_total_residents")),
-            key="admin_min_total_residents"
-        )
 
     if st.button("基本設定を保存", use_container_width=True):
         try:
@@ -1783,7 +1768,6 @@ def page_admin_settings():
             set_setting("staff_max_off", str(staff_max_off))
             set_setting("min_chief", str(min_chief))
             set_setting("min_chief_clinical", str(min_chief_clinical))
-            set_setting("min_total_residents", str(min_total_residents))
             st.success("基本設定を保存しました。")
         except ValueError:
             st.error("締切日時の形式が不正です。例：2026-06-15 23:59")
@@ -2048,6 +2032,142 @@ def page_roles():
                 st.rerun()
 
 
+
+def page_input_data_overview():
+    st.header("入力データ一覧")
+
+    st.caption("管理者用：全員分の入力済みデータを確認します。")
+
+    db_file = Path("summer_vacation.db")
+    if db_file.exists():
+        st.download_button(
+            label="SQLite DBをダウンロード",
+            data=db_file.read_bytes(),
+            file_name="summer_vacation.db",
+            mime="application/octet-stream",
+            use_container_width=True
+        )
+
+    users = get_users(active_only=False)
+    user_map = {u["id"]: u for u in users}
+
+    st.subheader("ユーザー別提出状況")
+
+    summary_rows = []
+    for u in users:
+        reqs = get_requests(u["id"])
+        absences = get_absences(u["id"])
+        roles = get_roles(u["id"]) if u["category"] == USER_RESIDENT else []
+
+        vacation_dates = []
+        for r in reqs:
+            vacation_dates.extend(r.get("dates", []))
+
+        vacation_unique_dates = sorted(set(vacation_dates))
+
+        summary_rows.append({
+            "user_id": u["id"],
+            "氏名": u["name"],
+            "区分": u["category"],
+            "有効": "Yes" if int(u["active"]) == 1 else "No",
+            "夏季休暇希望件数": len(reqs),
+            "夏季休暇希望_勤務日数": len(vacation_unique_dates),
+            "既存不在件数": len(absences),
+            "役割期間件数": len(roles),
+        })
+
+    if summary_rows:
+        st.dataframe(summary_rows, use_container_width=True)
+    else:
+        st.info("ユーザーが登録されていません。")
+
+    st.markdown("---")
+    st.subheader("夏季休暇希望一覧")
+
+    request_rows = []
+    for r in get_requests():
+        dates = r.get("dates", [])
+        request_rows.append({
+            "希望ID": r["id"],
+            "user_id": r["user_id"],
+            "氏名": r["name"],
+            "区分": r["category"],
+            "勤務日数": len(dates),
+            "日付": ", ".join(dates),
+            "status": r["status"],
+            "submitted_at": r["submitted_at"],
+            "updated_at": r["updated_at"],
+            "備考": r.get("note") or "",
+        })
+
+    if request_rows:
+        st.dataframe(request_rows, use_container_width=True)
+    else:
+        st.info("夏季休暇希望はまだ登録されていません。")
+
+    st.markdown("---")
+    st.subheader("夏季休暇以外の不在一覧")
+
+    absence_rows = []
+    for a in get_absences():
+        absence_rows.append({
+            "不在ID": a["id"],
+            "user_id": a["user_id"],
+            "氏名": a["name"],
+            "開始日": a["start_date"],
+            "終了日": a["end_date"],
+            "種別": a["absence_type"],
+            "臨床不在扱い": "Yes" if int(a["counts_as_unavailable"]) == 1 else "No",
+            "備考": a.get("description") or "",
+            "created_at": a["created_at"],
+        })
+
+    if absence_rows:
+        st.dataframe(absence_rows, use_container_width=True)
+    else:
+        st.info("夏季休暇以外の不在はまだ登録されていません。")
+
+    st.markdown("---")
+    st.subheader("レジデント役割一覧")
+
+    role_rows = []
+    for r in get_roles():
+        role_rows.append({
+            "role_id": r["id"],
+            "user_id": r["user_id"],
+            "氏名": r["name"],
+            "開始日": r["start_date"],
+            "終了日": r["end_date"],
+            "役割": r["role"],
+        })
+
+    if role_rows:
+        st.dataframe(role_rows, use_container_width=True)
+    else:
+        st.info("レジデント役割はまだ登録されていません。")
+
+    st.markdown("---")
+    st.subheader("確定・仮確定予定一覧")
+
+    assignment_rows = []
+    for a in get_assignments():
+        assignment_rows.append({
+            "assignment_id": a["id"],
+            "user_id": a["user_id"],
+            "氏名": a["name"],
+            "区分": a["category"],
+            "日付": a["vacation_date"],
+            "status": a["status"],
+            "source_pattern_id": a.get("source_pattern_id"),
+            "confirmed_at": a.get("confirmed_at"),
+        })
+
+    if assignment_rows:
+        st.dataframe(assignment_rows, use_container_width=True)
+    else:
+        st.info("確定・仮確定予定はまだありません。")
+
+
 def main():
     st.set_page_config(page_title="夏季休暇調整アプリ", layout="wide")
     init_db()
@@ -2071,6 +2191,7 @@ def main():
             "レジデント役割": page_roles,
             "不在・休暇入力": page_personal_inputs,
             "一括判定・確定": page_batch_review,
+            "入力データ一覧": page_input_data_overview,
             "予定一覧": page_assignments,
             "稼働状況": page_dashboard,
         }
