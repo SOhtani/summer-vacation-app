@@ -149,9 +149,32 @@ def init_db() -> None:
             label TEXT
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS conferences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            short_label TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            location TEXT,
+            UNIQUE(name, start_date, end_date)
+        )
+    """)
 
     for k, v in DEFAULT_SETTINGS.items():
         cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
+
+    conference_seeds = [
+        ("WCLC 2026 / 世界肺癌学会", "WCLC", "2026-09-12", "2026-09-15", "Seoul, Republic of Korea"),
+        ("第79回日本胸部外科学会定期学術集会", "胸外", "2026-10-20", "2026-10-22", "国立京都国際会館"),
+        ("第67回日本肺癌学会学術集会", "肺癌", "2026-12-03", "2026-12-05", "神戸コンベンションセンター"),
+    ]
+
+    for name, short_label, start_date, end_date, location in conference_seeds:
+        cur.execute(
+            "INSERT OR IGNORE INTO conferences(name, short_label, start_date, end_date, location) VALUES (?, ?, ?, ?, ?)",
+            (name, short_label, start_date, end_date, location)
+        )
 
     # 日本の祝日を自動登録
     try:
@@ -206,6 +229,48 @@ def get_non_working_days() -> set:
     rows = conn.execute("SELECT holiday_date FROM non_working_days").fetchall()
     conn.close()
     return {parse_date(r["holiday_date"]) for r in rows}
+
+
+
+def get_conferences() -> List[Dict]:
+    conn = connect()
+    try:
+        rows = conn.execute("""
+            SELECT *
+            FROM conferences
+            ORDER BY start_date, name
+        """).fetchall()
+        return rows_to_dicts(rows)
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
+def get_conference_labels_by_date() -> Dict[date, List[str]]:
+    labels: Dict[date, List[str]] = {}
+
+    for c in get_conferences():
+        start = parse_date(c["start_date"])
+        end = parse_date(c["end_date"])
+
+        for d in to_dates(start, end):
+            labels.setdefault(d, []).append(c["short_label"])
+
+    return labels
+
+
+def get_conference_overlaps(start: date, end: date) -> List[Dict]:
+    overlaps: List[Dict] = []
+
+    for c in get_conferences():
+        c_start = parse_date(c["start_date"])
+        c_end = parse_date(c["end_date"])
+
+        if start <= c_end and end >= c_start:
+            overlaps.append(c)
+
+    return overlaps
 
 
 def is_workday(d: date) -> bool:
@@ -1084,12 +1149,14 @@ def compact_date_selector(label: str, key: str, default: date) -> date:
 
 
 
+
 def mobile_range_calendar(label: str, key: str, default_start: Optional[date], default_end: Optional[date]) -> Tuple[Optional[date], Optional[date]]:
     st.markdown(f"**{label}**")
 
     season_start = parse_date(get_setting("season_start"))
     season_end = parse_date(get_setting("season_end"))
     non_working = get_non_working_days()
+    conference_labels_by_date = get_conference_labels_by_date()
 
     start_key = f"{key}_start"
     end_key = f"{key}_end"
@@ -1100,7 +1167,6 @@ def mobile_range_calendar(label: str, key: str, default_start: Optional[date], d
     if end_key not in st.session_state:
         st.session_state[end_key] = default_end
     if ym_key not in st.session_state:
-        # 初期表示月は対象期間の開始月。日付は未選択。
         st.session_state[ym_key] = date(season_start.year, season_start.month, 1)
 
     month_base = st.session_state[ym_key]
@@ -1136,7 +1202,7 @@ def mobile_range_calendar(label: str, key: str, default_start: Optional[date], d
                 st.session_state[ym_key] = new_month
             st.rerun()
 
-    st.caption("1回目で開始日、2回目で終了日を選択。🔵土曜、🔴日曜・祝日、🟩選択範囲。")
+    st.caption("1回目で開始日、2回目で終了日を選択。🔵土曜、🔴日曜・祝日、🎓WCLC/胸外/肺癌、🟩選択範囲。")
 
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
     header_cols = st.columns(7)
@@ -1169,6 +1235,7 @@ def mobile_range_calendar(label: str, key: str, default_start: Optional[date], d
 
     for week_start in range(0, len(days), 7):
         cols = st.columns(7)
+
         for i, d in enumerate(days[week_start:week_start + 7]):
             if d is None:
                 cols[i].markdown(" ")
@@ -1179,6 +1246,9 @@ def mobile_range_calendar(label: str, key: str, default_start: Optional[date], d
             is_saturday = d.weekday() == 5
             is_sunday = d.weekday() == 6
 
+            conference_labels = conference_labels_by_date.get(d, [])
+            conference_text = "/".join(conference_labels)
+
             in_range = False
             if current_start is not None and current_end is None:
                 in_range = d == current_start
@@ -1187,8 +1257,12 @@ def mobile_range_calendar(label: str, key: str, default_start: Optional[date], d
 
             if outside_season:
                 label_text = f"· {d.day}"
+            elif in_range and conference_text:
+                label_text = f"🟩🎓{conference_text} {d.day}"
             elif in_range:
                 label_text = f"🟩 {d.day}"
+            elif conference_text:
+                label_text = f"🎓{conference_text} {d.day}"
             elif is_holiday:
                 label_text = f"🔴祝 {d.day}"
             elif is_sunday:
@@ -1196,25 +1270,27 @@ def mobile_range_calendar(label: str, key: str, default_start: Optional[date], d
             elif is_saturday:
                 label_text = f"🔵 {d.day}"
             else:
-                label_text = f"　{d.day}"
+                label_text = f"{d.day}"
 
-            if cols[i].button(label_text, key=f"{key}_{d.isoformat()}", disabled=outside_season, use_container_width=True):
+            if cols[i].button(
+                label_text,
+                key=f"{key}_{d.isoformat()}",
+                disabled=outside_season,
+                use_container_width=True
+            ):
                 s0 = st.session_state[start_key]
                 e0 = st.session_state[end_key]
 
                 if s0 is None:
-                    # 1回目：開始日を選択
                     st.session_state[start_key] = d
                     st.session_state[end_key] = None
                 elif e0 is None:
-                    # 2回目：終了日を選択。開始日より前なら開始日を選び直し。
                     if d >= s0:
                         st.session_state[end_key] = d
                     else:
                         st.session_state[start_key] = d
                         st.session_state[end_key] = None
                 else:
-                    # 既に範囲選択済みなら、新しい開始日として選び直し。
                     st.session_state[start_key] = d
                     st.session_state[end_key] = None
 
@@ -1247,8 +1323,24 @@ def mobile_range_calendar(label: str, key: str, default_start: Optional[date], d
     if ne.weekday() >= 5 or ne in non_working:
         st.warning("終了日は非勤務日です。勤務日数には含まれません。")
 
-    return ns, ne
+    overlaps = get_conference_overlaps(ns, ne)
+    if overlaps:
+        overlap_lines = []
+        for c in overlaps:
+            line = (
+                f"- {c['short_label']}（{c['name']}）: "
+                f"{c['start_date']}〜{c['end_date']}"
+            )
+            if c.get("location"):
+                line += f" / {c['location']}"
+            overlap_lines.append(line)
 
+        st.warning(
+            "選択範囲に学会期間が含まれます:\n"
+            + "\n".join(overlap_lines)
+        )
+
+    return ns, ne
 
 
 
