@@ -9,11 +9,128 @@ from email.mime.text import MIMEText
 import urllib.request
 import urllib.error
 import json
+import base64
+import hashlib
 import csv
 import io
 import jpholiday
 
 DB_PATH = Path("summer_vacation.db")
+
+BACKUP_STATUS_KEY = "last_backup_status"
+BACKUP_HASH_KEY = "last_backup_hash"
+
+
+def get_secret_value(key: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+def github_api_request(method: str, url: str, token: str, payload: Optional[dict] = None) -> Tuple[int, dict]:
+    data = None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "summer-vacation-app",
+    }
+
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers,
+        method=method
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as res:
+            body = res.read().decode("utf-8")
+            return res.status, json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        try:
+            parsed = json.loads(body) if body else {}
+        except Exception:
+            parsed = {"message": body}
+        return e.code, parsed
+    except Exception as e:
+        return 0, {"message": str(e)}
+
+
+def auto_backup_db(force: bool = False) -> None:
+    """
+    Streamlit Cloud上のSQLiteは永続保存に不向きなので、
+    変更後の summer_vacation.db をGitHub backup repoへ自動保存する。
+    """
+    if not DB_PATH.exists():
+        return
+
+    token = get_secret_value("GITHUB_BACKUP_TOKEN")
+    repo = get_secret_value("GITHUB_BACKUP_REPO")
+    branch = get_secret_value("GITHUB_BACKUP_BRANCH", "main")
+    backup_path = get_secret_value("GITHUB_BACKUP_PATH", "backups/summer_vacation_latest.db")
+
+    if not token or not repo or not backup_path:
+        try:
+            st.session_state[BACKUP_STATUS_KEY] = "GitHubバックアップ未設定"
+        except Exception:
+            pass
+        return
+
+    db_bytes = DB_PATH.read_bytes()
+    current_hash = hashlib.sha256(db_bytes).hexdigest()
+
+    if not force:
+        try:
+            if st.session_state.get(BACKUP_HASH_KEY) == current_hash:
+                return
+        except Exception:
+            pass
+
+    api_base = f"https://api.github.com/repos/{repo}/contents/{backup_path}"
+
+    # 既存ファイルのshaを取得。存在しなければ新規作成。
+    get_url = f"{api_base}?ref={branch}"
+    status, current = github_api_request("GET", get_url, token)
+
+    existing_sha = None
+    if status == 200:
+        existing_sha = current.get("sha")
+    elif status not in (404,):
+        try:
+            st.session_state[BACKUP_STATUS_KEY] = f"バックアップ取得失敗: {current.get('message')}"
+        except Exception:
+            pass
+        return
+
+    payload = {
+        "message": f"Auto backup summer_vacation.db {datetime.now().isoformat(timespec='seconds')}",
+        "content": base64.b64encode(db_bytes).decode("utf-8"),
+        "branch": branch,
+    }
+
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    status, result = github_api_request("PUT", api_base, token, payload)
+
+    if status in (200, 201):
+        try:
+            st.session_state[BACKUP_HASH_KEY] = current_hash
+            st.session_state[BACKUP_STATUS_KEY] = f"最終バックアップ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        except Exception:
+            pass
+    else:
+        try:
+            st.session_state[BACKUP_STATUS_KEY] = f"バックアップ失敗: {result.get('message')}"
+        except Exception:
+            pass
+
 
 ROLE_CHIEF = "chief"
 ROLE_CLINICAL = "clinical"
@@ -2391,6 +2508,13 @@ def main():
     st.sidebar.write("対象期間:", get_setting("season_start"), "〜", get_setting("season_end"))
     st.sidebar.write("初回締切:", get_setting("initial_deadline"))
     pages[choice]()
+
+    # 入力・削除・設定変更後のDBを自動バックアップ
+    auto_backup_db()
+
+    backup_status = st.session_state.get(BACKUP_STATUS_KEY)
+    if backup_status:
+        st.sidebar.caption(backup_status)
 
 
 if __name__ == "__main__":
