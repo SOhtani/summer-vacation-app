@@ -9,6 +9,8 @@ from email.mime.text import MIMEText
 import urllib.request
 import urllib.error
 import json
+import shutil
+import zipfile
 import base64
 import hashlib
 import csv
@@ -2470,9 +2472,561 @@ def page_input_data_overview():
         st.info("確定・仮確定予定はまだありません。")
 
 
+
+def ensure_operational_tables():
+    conn = connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS operation_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            action TEXT NOT NULL,
+            user_id INTEGER,
+            detail TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS conferences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            short_label TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            location TEXT,
+            UNIQUE(name, start_date, end_date)
+        )
+    """)
+
+    conference_seeds = [
+        ("WCLC 2026 / 世界肺癌学会", "WCLC", "2026-09-12", "2026-09-15", "Seoul, Republic of Korea"),
+        ("第79回日本胸部外科学会定期学術集会", "胸外", "2026-10-20", "2026-10-22", "国立京都国際会館"),
+        ("第67回日本肺癌学会学術集会", "肺癌", "2026-12-03", "2026-12-05", "神戸コンベンションセンター"),
+    ]
+
+    for name, short_label, start_date, end_date, location in conference_seeds:
+        cur.execute(
+            "INSERT OR IGNORE INTO conferences(name, short_label, start_date, end_date, location) VALUES (?, ?, ?, ?, ?)",
+            (name, short_label, start_date, end_date, location)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def log_operation(action: str, detail: str = "", user_id: Optional[int] = None) -> None:
+    try:
+        ensure_operational_tables()
+        conn = connect()
+        conn.execute(
+            "INSERT INTO operation_logs(created_at, action, user_id, detail) VALUES (?, ?, ?, ?)",
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                action,
+                user_id,
+                detail[:2000] if detail else ""
+            )
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _safe_auto_backup() -> None:
+    try:
+        if "auto_backup_db" in globals():
+            auto_backup_db(force=True)
+    except Exception:
+        pass
+
+
+def _install_operation_wrappers():
+    if st.session_state.get("_operation_wrappers_installed"):
+        return
+
+    mutation_specs = [
+        ("add_user", "add_user"),
+        ("update_user", "update_user"),
+        ("add_role", "add_role"),
+        ("delete_role", "delete_role"),
+        ("add_absence", "add_absence"),
+        ("delete_absence", "delete_absence"),
+        ("add_or_replace_request", "save_vacation_request"),
+        ("delete_request", "delete_vacation_request"),
+        ("add_assignment", "add_assignment"),
+        ("confirm_tentative_assignments", "confirm_assignments"),
+        ("delete_assignment", "delete_assignment"),
+        ("set_setting", "set_setting"),
+    ]
+
+    for fn_name, action in mutation_specs:
+        original = globals().get(fn_name)
+        if original is None:
+            continue
+        if getattr(original, "_operation_wrapped", False):
+            continue
+
+        def make_wrapper(orig, act, name):
+            def wrapped(*args, **kwargs):
+                result = orig(*args, **kwargs)
+
+                user_id = None
+                if name in ["add_role", "add_absence", "add_or_replace_request", "add_assignment"]:
+                    if len(args) >= 1:
+                        try:
+                            user_id = int(args[0])
+                        except Exception:
+                            user_id = None
+
+                safe_detail = ""
+                if act == "set_setting":
+                    key = args[0] if len(args) >= 1 else ""
+                    safe_detail = f"key={key}"
+                else:
+                    safe_detail = f"function={name}"
+
+                log_operation(act, safe_detail, user_id)
+                _safe_auto_backup()
+                return result
+
+            wrapped._operation_wrapped = True
+            return wrapped
+
+        globals()[fn_name] = make_wrapper(original, action, fn_name)
+
+    st.session_state["_operation_wrappers_installed"] = True
+
+
+def _github_secret(key: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+def _github_api(method: str, url: str, token: str, payload: Optional[dict] = None) -> Tuple[int, dict]:
+    data = None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "summer-vacation-app",
+    }
+
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            body = res.read().decode("utf-8")
+            return res.status, json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        try:
+            parsed = json.loads(body) if body else {}
+        except Exception:
+            parsed = {"message": body}
+        return e.code, parsed
+    except Exception as e:
+        return 0, {"message": str(e)}
+
+
+def restore_db_from_github_backup() -> Tuple[bool, str]:
+    token = _github_secret("GITHUB_BACKUP_TOKEN")
+    repo = _github_secret("GITHUB_BACKUP_REPO")
+    branch = _github_secret("GITHUB_BACKUP_BRANCH", "main")
+    backup_path = _github_secret("GITHUB_BACKUP_PATH", "backups/summer_vacation_latest.db")
+
+    if not token or not repo or not backup_path:
+        return False, "GitHubバックアップ設定がありません。Streamlit Secretsを確認してください。"
+
+    url = f"https://api.github.com/repos/{repo}/contents/{backup_path}?ref={branch}"
+    status, result = _github_api("GET", url, token)
+
+    if status != 200:
+        return False, f"バックアップ取得に失敗しました: {result.get('message')}"
+
+    content = result.get("content", "")
+    if not content:
+        return False, "バックアップファイルのcontentが空です。"
+
+    try:
+        db_bytes = base64.b64decode(content)
+    except Exception as e:
+        return False, f"バックアップDBのdecodeに失敗しました: {e}"
+
+    if DB_PATH.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safety_copy = Path(f"summer_vacation_before_restore_{timestamp}.db")
+        shutil.copyfile(DB_PATH, safety_copy)
+
+    DB_PATH.write_bytes(db_bytes)
+
+    try:
+        ensure_operational_tables()
+        log_operation("restore_from_github_backup", f"path={backup_path}", None)
+    except Exception:
+        pass
+
+    return True, "GitHubバックアップから復元しました。画面を再読み込みします。"
+
+
+def build_csv_export_zip() -> bytes:
+    ensure_operational_tables()
+
+    table_queries = {
+        "users.csv": "SELECT * FROM users ORDER BY id",
+        "resident_roles.csv": """
+            SELECT rr.id, u.name, rr.user_id, rr.start_date, rr.end_date, rr.role
+            FROM resident_roles rr
+            JOIN users u ON rr.user_id = u.id
+            ORDER BY u.name, rr.start_date
+        """,
+        "absences.csv": """
+            SELECT a.id, u.name, a.user_id, a.start_date, a.end_date, a.absence_type,
+                   a.description, a.counts_as_unavailable, a.created_at
+            FROM absences a
+            JOIN users u ON a.user_id = u.id
+            ORDER BY a.start_date, u.name
+        """,
+        "vacation_requests.csv": """
+            SELECT rp.id AS pattern_id, u.name, rp.user_id, rp.preference_rank,
+                   rp.status, rp.submitted_at, rp.updated_at, rp.note,
+                   GROUP_CONCAT(rd.vacation_date, ',') AS dates
+            FROM request_patterns rp
+            JOIN users u ON rp.user_id = u.id
+            LEFT JOIN request_dates rd ON rp.id = rd.pattern_id
+            GROUP BY rp.id
+            ORDER BY u.name, rp.id
+        """,
+        "assignments.csv": """
+            SELECT a.id, u.name, a.user_id, a.vacation_date, a.source_pattern_id,
+                   a.status, a.confirmed_at
+            FROM assignments a
+            JOIN users u ON a.user_id = u.id
+            ORDER BY a.vacation_date, u.name
+        """,
+        "conflicts.csv": "SELECT * FROM conflicts ORDER BY created_at DESC",
+        "conferences.csv": "SELECT * FROM conferences ORDER BY start_date",
+        "operation_logs.csv": "SELECT * FROM operation_logs ORDER BY created_at DESC",
+        "non_working_days.csv": "SELECT * FROM non_working_days ORDER BY holiday_date",
+        "settings.csv": "SELECT key, value FROM settings ORDER BY key",
+    }
+
+    memory = io.BytesIO()
+
+    conn = connect()
+    with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, query in table_queries.items():
+            try:
+                rows = conn.execute(query).fetchall()
+                output = io.StringIO()
+                writer = csv.writer(output)
+
+                if rows:
+                    writer.writerow(rows[0].keys())
+                    for row in rows:
+                        writer.writerow([row[k] for k in row.keys()])
+                else:
+                    writer.writerow([])
+
+                zf.writestr(filename, output.getvalue())
+            except Exception as e:
+                zf.writestr(filename.replace(".csv", "_ERROR.txt"), str(e))
+    conn.close()
+
+    memory.seek(0)
+    return memory.read()
+
+
+def _date_ranges_from_dates(date_list: List[date]) -> str:
+    if not date_list:
+        return ""
+
+    dates = sorted(set(date_list))
+    ranges = []
+    start = dates[0]
+    prev = dates[0]
+
+    for d in dates[1:]:
+        if d == prev + timedelta(days=1):
+            prev = d
+        else:
+            ranges.append((start, prev))
+            start = d
+            prev = d
+
+    ranges.append((start, prev))
+
+    parts = []
+    for s0, e0 in ranges:
+        if s0 == e0:
+            parts.append(s0.isoformat())
+        else:
+            parts.append(f"{s0.isoformat()}〜{e0.isoformat()}")
+
+    return ", ".join(parts)
+
+
+def page_data_maintenance():
+    st.header("データ保守・復元")
+
+    ensure_operational_tables()
+
+    st.subheader("SQLite DBダウンロード")
+
+    if DB_PATH.exists():
+        st.download_button(
+            label="SQLite DBをダウンロード",
+            data=DB_PATH.read_bytes(),
+            file_name="summer_vacation.db",
+            mime="application/octet-stream",
+            use_container_width=True
+        )
+    else:
+        st.error("summer_vacation.db が見つかりません。")
+
+    st.markdown("---")
+    st.subheader("CSV export")
+
+    st.caption("全主要テーブルをCSVとしてzipで出力します。")
+
+    csv_zip = build_csv_export_zip()
+    st.download_button(
+        label="CSV一括ダウンロード",
+        data=csv_zip,
+        file_name=f"summer_vacation_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+        mime="application/zip",
+        use_container_width=True
+    )
+
+    st.markdown("---")
+    st.subheader("GitHubバックアップから復元")
+
+    st.warning(
+        "復元を実行すると、現在のSQLite DBはGitHubバックアップの内容で上書きされます。"
+        "実行前に現在のDBは自動で safety copy として保存されます。"
+    )
+
+    confirm = st.checkbox("GitHubバックアップから復元することを理解しました。")
+
+    if st.button("GitHubバックアップから復元", disabled=not confirm, use_container_width=True):
+        ok, msg = restore_db_from_github_backup()
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    st.markdown("---")
+    st.subheader("バックアップ状態")
+
+    backup_status = st.session_state.get(BACKUP_STATUS_KEY, "不明")
+    st.write(backup_status)
+
+    if st.button("今すぐGitHubへバックアップ", use_container_width=True):
+        try:
+            auto_backup_db(force=True)
+            st.success(st.session_state.get(BACKUP_STATUS_KEY, "バックアップを実行しました。"))
+        except Exception as e:
+            st.error(f"バックアップに失敗しました: {e}")
+
+
+def page_operational_warnings():
+    st.header("警告一覧")
+
+    ensure_operational_tables()
+
+    required = int(get_setting("required_workdays"))
+    season_start = parse_date(get_setting("season_start"))
+    season_end = parse_date(get_setting("season_end"))
+    season_workdays = workdays_between(season_start, season_end)
+
+    users = get_users(active_only=True)
+
+    st.subheader("未提出・10日未満")
+
+    rows = []
+    for u in users:
+        reqs = get_requests(u["id"])
+        all_dates = []
+        for r in reqs:
+            all_dates.extend([parse_date(x) for x in r.get("dates", [])])
+
+        unique_dates = sorted(set(all_dates))
+        n = len(unique_dates)
+
+        if n == 0:
+            status = "未提出"
+        elif n < required:
+            status = "10日未満"
+        elif n == required:
+            status = "OK"
+        else:
+            status = "10日超過"
+
+        rows.append({
+            "user_id": u["id"],
+            "氏名": u["name"],
+            "区分": u["category"],
+            "入力済み勤務日数": n,
+            "必要勤務日数": required,
+            "status": status,
+            "日付": ", ".join(d.isoformat() for d in unique_dates),
+        })
+
+    st.dataframe(rows, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("レジデント役割未設定")
+
+    missing_rows = []
+
+    for u in users:
+        if u["category"] != USER_RESIDENT:
+            continue
+
+        missing_dates = []
+        for d in season_workdays:
+            if role_on_date(u["id"], d) is None:
+                missing_dates.append(d)
+
+        if missing_dates:
+            missing_rows.append({
+                "user_id": u["id"],
+                "氏名": u["name"],
+                "未設定勤務日数": len(missing_dates),
+                "未設定期間": _date_ranges_from_dates(missing_dates),
+            })
+
+    if missing_rows:
+        st.dataframe(missing_rows, use_container_width=True)
+    else:
+        st.success("レジデント役割未設定日はありません。")
+
+    st.markdown("---")
+    st.subheader("夏季休暇と既存不在の重複")
+
+    overlap_rows = []
+    for u in users:
+        req_dates = []
+        for r in get_requests(u["id"]):
+            req_dates.extend([parse_date(x) for x in r.get("dates", [])])
+        req_set = set(req_dates)
+
+        for a in get_absences(u["id"]):
+            absence_dates = set(workdays_between(parse_date(a["start_date"]), parse_date(a["end_date"])))
+            overlaps = sorted(req_set & absence_dates)
+            if overlaps:
+                overlap_rows.append({
+                    "user_id": u["id"],
+                    "氏名": u["name"],
+                    "不在種別": a["absence_type"],
+                    "不在期間": f"{a['start_date']}〜{a['end_date']}",
+                    "重複日": ", ".join(d.isoformat() for d in overlaps),
+                })
+
+    if overlap_rows:
+        st.dataframe(overlap_rows, use_container_width=True)
+    else:
+        st.success("夏季休暇希望と既存不在の重複はありません。")
+
+
+def page_conflict_dashboard():
+    st.header("コンフリクト状況")
+
+    ensure_operational_tables()
+
+    st.subheader("未解決コンフリクト")
+
+    open_conflicts = get_conflicts(open_only=True)
+
+    if open_conflicts:
+        rows = []
+        for c in open_conflicts:
+            row = dict(c)
+            try:
+                row["involved_names"] = conflict_user_names(c)
+            except Exception:
+                row["involved_names"] = ""
+            rows.append(row)
+        st.dataframe(rows, use_container_width=True)
+    else:
+        st.success("未解決コンフリクトはありません。")
+
+    st.markdown("---")
+    st.subheader("現在の仮確定・確定予定に対する再評価")
+
+    assignments = get_assignments(statuses=[STATUS_TENTATIVE, STATUS_CONFIRMED])
+    assignment_pairs = [(a["user_id"], parse_date(a["vacation_date"])) for a in assignments]
+
+    if st.button("現在の予定でコンフリクトを再評価", use_container_width=True):
+        ok, conflicts = evaluate_dates(assignment_pairs)
+
+        if ok:
+            conn = connect()
+            conn.execute("UPDATE conflicts SET resolved = 1 WHERE resolved = 0")
+            conn.commit()
+            conn.close()
+            log_operation("resolve_conflicts_by_recheck", "current assignments OK", None)
+            _safe_auto_backup()
+            st.success("現在の予定ではコンフリクトはありません。未解決コンフリクトを解決済みにしました。")
+            st.rerun()
+        else:
+            run_id = reset_conflicts()
+            for c in conflicts:
+                add_conflict(run_id, c["date"], c["type"], c["detail"], c["involved"])
+            log_operation("recheck_conflicts", f"{len(conflicts)} conflicts", None)
+            _safe_auto_backup()
+            st.error(f"{len(conflicts)}件のコンフリクトがあります。")
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("現在のコンフリクト詳細")
+
+    ok, current_conflicts = evaluate_dates(assignment_pairs)
+    if ok:
+        st.success("現在の仮確定・確定予定ではコンフリクトはありません。")
+    else:
+        st.dataframe(current_conflicts, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("日別稼働状況へのリンク")
+    st.caption("詳細な日別人数は「稼働状況」ページで確認してください。")
+
+
+def page_operation_logs():
+    st.header("操作ログ")
+
+    ensure_operational_tables()
+
+    conn = connect()
+    rows = rows_to_dicts(
+        conn.execute("""
+            SELECT ol.id, ol.created_at, ol.action, ol.user_id, u.name AS user_name, ol.detail
+            FROM operation_logs ol
+            LEFT JOIN users u ON ol.user_id = u.id
+            ORDER BY ol.created_at DESC
+            LIMIT 500
+        """).fetchall()
+    )
+    conn.close()
+
+    if rows:
+        st.dataframe(rows, use_container_width=True)
+    else:
+        st.info("操作ログはまだありません。")
+
+
 def main():
     st.set_page_config(page_title="夏季休暇調整アプリ", layout="wide")
     init_db()
+    ensure_operational_tables()
+    _install_operation_wrappers()
 
     st.title("夏季休暇調整アプリ")
     st.caption("初回締切時に全希望を同時評価し、締切後は既存予定とのコンフリクトを随時判定します。")
@@ -2494,6 +3048,10 @@ def main():
             "不在・休暇入力": page_personal_inputs,
             "一括判定・確定": page_batch_review,
             "入力データ一覧": page_input_data_overview,
+            "警告一覧": page_operational_warnings,
+            "コンフリクト状況": page_conflict_dashboard,
+            "データ保守・復元": page_data_maintenance,
+            "操作ログ": page_operation_logs,
             "予定一覧": page_assignments,
             "稼働状況": page_dashboard,
         }
