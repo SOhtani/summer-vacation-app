@@ -3022,9 +3022,246 @@ def page_operation_logs():
         st.info("操作ログはまだありません。")
 
 
+
+def ensure_soft_delete_columns():
+    conn = connect()
+    cur = conn.cursor()
+
+    # absences に soft delete 用カラムを追加
+    try:
+        cur.execute("ALTER TABLE absences ADD COLUMN deleted_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # request_patterns は既に status があるため deleted status を使う
+    conn.commit()
+    conn.close()
+
+
+def get_absences(user_id: Optional[int] = None) -> List[Dict]:
+    ensure_soft_delete_columns()
+
+    conn = connect()
+    if user_id is None:
+        rows = conn.execute("""
+            SELECT a.*, u.name
+            FROM absences a
+            JOIN users u ON a.user_id = u.id
+            WHERE a.deleted_at IS NULL
+            ORDER BY a.start_date, u.name
+        """).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT a.*, u.name
+            FROM absences a
+            JOIN users u ON a.user_id = u.id
+            WHERE a.user_id = ?
+              AND a.deleted_at IS NULL
+            ORDER BY a.start_date
+        """, (user_id,)).fetchall()
+
+    conn.close()
+    return rows_to_dicts(rows)
+
+
+def delete_absence(absence_id: int) -> None:
+    ensure_soft_delete_columns()
+
+    conn = connect()
+    conn.execute(
+        "UPDATE absences SET deleted_at = ? WHERE id = ?",
+        (datetime.now().isoformat(timespec="seconds"), absence_id)
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        log_operation("soft_delete_absence", f"absence_id={absence_id}", None)
+        auto_backup_db(force=True)
+    except Exception:
+        pass
+
+
+def get_requests(user_id: Optional[int] = None) -> List[Dict]:
+    conn = connect()
+
+    if user_id is None:
+        rows = conn.execute("""
+            SELECT rp.*, u.name, u.category
+            FROM request_patterns rp
+            JOIN users u ON rp.user_id = u.id
+            WHERE COALESCE(rp.status, '') != 'deleted'
+            ORDER BY u.name, rp.preference_rank, rp.id
+        """).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT rp.*, u.name, u.category
+            FROM request_patterns rp
+            JOIN users u ON rp.user_id = u.id
+            WHERE rp.user_id = ?
+              AND COALESCE(rp.status, '') != 'deleted'
+            ORDER BY rp.preference_rank, rp.id
+        """, (user_id,)).fetchall()
+
+    result = []
+    for r in rows:
+        drows = conn.execute(
+            "SELECT vacation_date FROM request_dates WHERE pattern_id = ? ORDER BY vacation_date",
+            (r["id"],)
+        ).fetchall()
+        item = dict(r)
+        item["dates"] = [x["vacation_date"] for x in drows]
+        result.append(item)
+
+    conn.close()
+    return result
+
+
+def delete_request(pattern_id: int) -> None:
+    # 物理削除しない。status=deleted として残す。
+    conn = connect()
+    conn.execute(
+        "UPDATE request_patterns SET status = ?, updated_at = ? WHERE id = ?",
+        ("deleted", datetime.now().isoformat(timespec="seconds"), pattern_id)
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        log_operation("soft_delete_vacation_request", f"pattern_id={pattern_id}", None)
+        auto_backup_db(force=True)
+    except Exception:
+        pass
+
+
+def db_physical_count_summary(db_path: Path) -> Dict[str, int]:
+    """
+    soft delete を含む物理行数。
+    古いDB・初期DBによる巻き戻り検出に使う。
+    通常削除はsoft deleteなので物理行数は減らない。
+    """
+    tables = [
+        "users",
+        "resident_roles",
+        "absences",
+        "request_patterns",
+        "request_dates",
+        "assignments",
+    ]
+
+    result = {t: 0 for t in tables}
+
+    if not db_path.exists():
+        return result
+
+    conn = sqlite3.connect(db_path)
+    try:
+        for t in tables:
+            try:
+                row = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
+                result[t] = int(row[0]) if row else 0
+            except Exception:
+                result[t] = 0
+    finally:
+        conn.close()
+
+    return result
+
+
+def db_active_count_summary(db_path: Path) -> Dict[str, int]:
+    """
+    画面上で有効なデータ数。
+    soft delete 済みは除外。
+    表示・警告用。
+    """
+    result = {
+        "users": 0,
+        "resident_roles": 0,
+        "absences": 0,
+        "request_patterns": 0,
+        "request_dates": 0,
+        "assignments": 0,
+    }
+
+    if not db_path.exists():
+        return result
+
+    conn = sqlite3.connect(db_path)
+    try:
+        try:
+            result["users"] = conn.execute("SELECT COUNT(*) FROM users WHERE active = 1").fetchone()[0]
+        except Exception:
+            pass
+
+        try:
+            result["resident_roles"] = conn.execute("SELECT COUNT(*) FROM resident_roles").fetchone()[0]
+        except Exception:
+            pass
+
+        try:
+            result["absences"] = conn.execute("SELECT COUNT(*) FROM absences WHERE deleted_at IS NULL").fetchone()[0]
+        except Exception:
+            result["absences"] = conn.execute("SELECT COUNT(*) FROM absences").fetchone()[0]
+
+        try:
+            result["request_patterns"] = conn.execute("""
+                SELECT COUNT(*) FROM request_patterns
+                WHERE COALESCE(status, '') != 'deleted'
+            """).fetchone()[0]
+        except Exception:
+            pass
+
+        try:
+            result["request_dates"] = conn.execute("""
+                SELECT COUNT(*)
+                FROM request_dates rd
+                JOIN request_patterns rp ON rd.pattern_id = rp.id
+                WHERE COALESCE(rp.status, '') != 'deleted'
+            """).fetchone()[0]
+        except Exception:
+            pass
+
+        try:
+            result["assignments"] = conn.execute("SELECT COUNT(*) FROM assignments").fetchone()[0]
+        except Exception:
+            pass
+
+    finally:
+        conn.close()
+
+    return result
+
+
+def db_count_summary(db_path: Path) -> Dict[str, int]:
+    # 既存コード互換用。物理行数を返す。
+    return db_physical_count_summary(db_path)
+
+
+def important_count_drop(current: Dict[str, int], remote: Dict[str, int]) -> Tuple[bool, str]:
+    """
+    通常削除はsoft deleteのため物理行数は減らない。
+    ここでは「古いDB・初期DBによる物理的な巻き戻り」だけを検出する。
+    """
+    watched = ["absences", "request_patterns", "request_dates"]
+
+    messages = []
+    for k in watched:
+        cur = current.get(k, 0)
+        rem = remote.get(k, 0)
+
+        if cur < rem:
+            messages.append(f"{k}: current_physical={cur} < backup_physical={rem}")
+
+    if messages:
+        return True, "; ".join(messages)
+
+    return False, ""
+
+
 def main():
     st.set_page_config(page_title="夏季休暇調整アプリ", layout="wide")
     init_db()
+    ensure_soft_delete_columns()
     ensure_operational_tables()
     _install_operation_wrappers()
 
