@@ -3305,7 +3305,6 @@ def main():
     pages[choice]()
 
     # 入力・削除・設定変更後のDBを自動バックアップ
-    auto_backup_db()
 
     backup_status = st.session_state.get(BACKUP_STATUS_KEY)
     if backup_status:
